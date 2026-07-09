@@ -110,6 +110,17 @@ export const api = {
     return handleResponse<BankTemplate>(res);
   },
 
+  async deleteTemplate(bankId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/banks/${bankId}/template`, {
+      method: 'DELETE',
+    });
+    return handleResponse<any>(res);
+  },
+
+  getTemplateDownloadUrl(bankId: number): string {
+    return `${API_BASE}/banks/${bankId}/template/download`;
+  },
+
   // Jobs
   async createJob(bankId: number, file: File): Promise<CreateJobResponse> {
     const formData = new FormData();

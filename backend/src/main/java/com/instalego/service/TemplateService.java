@@ -123,4 +123,24 @@ public class TemplateService {
     public List<BankTemplate> getTemplatesForBank(Long bankId) {
         return bankTemplateRepository.findByBankIdOrderByVersionDesc(bankId);
     }
+
+    /**
+     * Delete the active template for a bank.
+     */
+    public void deleteTemplate(Long bankId) {
+        BankTemplate template = bankTemplateRepository.findTopByBankIdOrderByVersionDesc(bankId)
+                .orElseThrow(() -> new IllegalArgumentException("No template found for bank id: " + bankId));
+
+        // Delete the file from disk
+        try {
+            Path filePath = Path.of(template.getTemplatePdfPath());
+            Files.deleteIfExists(filePath);
+            log.info("Deleted template file: {}", filePath);
+        } catch (IOException e) {
+            log.warn("Could not delete template file: {}", template.getTemplatePdfPath(), e);
+        }
+
+        bankTemplateRepository.delete(template);
+        log.info("Deleted template for bank {}: id={}, version={}", bankId, template.getId(), template.getVersion());
+    }
 }

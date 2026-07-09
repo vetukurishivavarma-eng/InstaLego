@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, Bank, JobStatusResponse } from '../api/client';
 
 const ACCEPTED_TYPES = '.pdf,.jpg,.jpeg,.png,.docx';
-const MAX_FILE_SIZE = 15 * 1024 * 1024; // 15MB
 const POLL_INTERVAL_MS = 2000;
 
 export default function UserPage() {
@@ -62,13 +61,6 @@ export default function UserPage() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
-
-    if (selectedFile.size > MAX_FILE_SIZE) {
-      setError('File size exceeds 15MB limit. Please choose a smaller file.');
-      setFile(null);
-      return;
-    }
-
     setError('');
     setFile(selectedFile);
   };
@@ -192,7 +184,7 @@ export default function UserPage() {
                     Drop your document here or click to browse
                   </p>
                   <p style={{ fontSize: '0.8125rem', color: 'var(--gray-400)', marginTop: '0.25rem' }}>
-                    PDF, JPG, PNG, or DOCX — Max 15MB
+                    PDF, JPG, PNG, or DOCX
                   </p>
                 </div>
               )}

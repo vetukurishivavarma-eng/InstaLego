@@ -9,8 +9,15 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 
 @RestController
 @RequestMapping("/api/banks/{bankId}/template")
@@ -83,5 +90,49 @@ public class TemplateController {
     @GetMapping("/versions")
     public ResponseEntity<List<BankTemplate>> getTemplateVersions(@PathVariable Long bankId) {
         return ResponseEntity.ok(templateService.getTemplatesForBank(bankId));
+    }
+
+    /**
+     * Delete the active template for a bank.
+     */
+    @DeleteMapping
+    public ResponseEntity<?> deleteTemplate(@PathVariable Long bankId) {
+        try {
+            templateService.deleteTemplate(bankId);
+            return ResponseEntity.ok(Map.of("message", "Template deleted successfully"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", "Failed to delete template: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Download the template PDF file.
+     */
+    @GetMapping("/download")
+    public ResponseEntity<?> downloadTemplate(@PathVariable Long bankId) {
+        try {
+            var templateOpt = templateService.getActiveTemplate(bankId);
+            if (templateOpt.isEmpty()) {
+                return ResponseEntity.notFound().build();
+            }
+
+            Path filePath = Path.of(templateOpt.get().getTemplatePdfPath());
+            if (!Files.exists(filePath)) {
+                return ResponseEntity.notFound().build();
+            }
+
+            org.springframework.core.io.Resource resource = new org.springframework.core.io.FileSystemResource(filePath.toFile());
+            return ResponseEntity.ok()
+                    .contentType(org.springframework.http.MediaType.APPLICATION_PDF)
+                    .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION,
+                            "inline; filename=\"template_" + bankId + ".pdf\"")
+                    .body(resource);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", e.getMessage()));
+        }
     }
 }
