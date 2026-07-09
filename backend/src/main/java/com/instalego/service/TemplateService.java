@@ -67,25 +67,33 @@ public class TemplateService {
         template.setFieldSchema("[]");
         BankTemplate saved = bankTemplateRepository.save(template);
 
-        // Derive schema using Gemini
+        // Derive schema using Gemini and auto-save it
         try {
             byte[] fileBytes = Files.readAllBytes(filePath);
             String base64Data = Base64.getEncoder().encodeToString(fileBytes);
             List<Map<String, Object>> derivedSchema = geminiService.deriveSchemaFromTemplate(base64Data, "application/pdf");
+
+            List<TemplateUploadResponse.FieldSchemaEntry> schemaEntries = derivedSchema.stream()
+                    .map(m -> TemplateUploadResponse.FieldSchemaEntry.builder()
+                            .fieldName((String) m.get("fieldName"))
+                            .description((String) m.getOrDefault("description", ""))
+                            .type((String) m.getOrDefault("type", "text"))
+                            .required((boolean) m.getOrDefault("required", false))
+                            .build())
+                    .toList();
+
+            // Auto-save the derived schema so template is immediately usable
+            String schemaJson = objectMapper.writeValueAsString(schemaEntries);
+            saved.setFieldSchema(schemaJson);
+            bankTemplateRepository.save(saved);
+            log.info("Auto-saved derived schema for bank {}: {} fields", bankId, schemaEntries.size());
 
             return TemplateUploadResponse.builder()
                     .templateId(saved.getId())
                     .bankId(bankId)
                     .templatePdfPath(filePath.toString())
                     .version(nextVersion)
-                    .derivedSchema(derivedSchema.stream()
-                            .map(m -> TemplateUploadResponse.FieldSchemaEntry.builder()
-                                    .fieldName((String) m.get("fieldName"))
-                                    .description((String) m.getOrDefault("description", ""))
-                                    .type((String) m.getOrDefault("type", "text"))
-                                    .required((boolean) m.getOrDefault("required", false))
-                                    .build())
-                            .toList())
+                    .derivedSchema(schemaEntries)
                     .build();
         } catch (Exception e) {
             log.error("Failed to derive schema from template for bank {}. Saving template without schema.", bankId, e);
