@@ -36,7 +36,7 @@ spring:
     activate:
       on-profile: prod
   datasource:
-    url: ${DATABASE_URL}
+    url: jdbc:${DATABASE_URL}
     driver-class-name: org.postgresql.Driver
     username: ${DATABASE_USERNAME}
     password: ${DATABASE_PASSWORD}
