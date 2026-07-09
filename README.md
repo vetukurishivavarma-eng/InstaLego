@@ -89,9 +89,6 @@ cd backend
 mvn spring-boot:run
 
 # Option B: Using Maven wrapper (auto-downloads Maven)
-# Generate the wrapper first (one-time):
-# mvn -N wrapper:wrapper
-# Then:
 ./mvnw spring-boot:run
 ```
 
@@ -171,6 +168,7 @@ It proxies `/api` requests to the backend at `http://localhost:8080`.
 ```
 InstaLego/
 ├── backend/
+│   ├── Dockerfile                 — Container image for Render/Docker
 │   ├── pom.xml
 │   └── src/main/java/com/instalego/
 │       ├── InstaLegoApplication.java
@@ -223,22 +221,68 @@ InstaLego/
 
 ## Deployment on Render
 
-### Backend (Web Service)
+> **Note**: Render's Web Service does **not** have a native "Java" runtime option. Use the **Docker** runtime instead (a `Dockerfile` is already included in `backend/`).
 
-1. **Build Command**: `cd backend && mvn clean package -DskipTests`
-2. **Start Command**: `java -jar backend/target/instalego-backend-0.0.1-SNAPSHOT.jar --spring.profiles.active=prod`
-3. **Environment Variables**:
-   - `GEMINI_API_KEY` — your Gemini API key
-   - `DATABASE_URL` — Render PostgreSQL internal URL
-   - `DATABASE_USERNAME` — from Render PostgreSQL
-   - `DATABASE_PASSWORD` — from Render PostgreSQL
+### Step 1: Create a PostgreSQL Database
 
-### Frontend (Static Site)
+1. Go to [dashboard.render.com](https://dashboard.render.com)
+2. Click **New +** → **PostgreSQL**
+3. Name: `instalego-db`, Database: `instalego`, User: `instalego_user`
+4. Click **Create Database**
+5. After provisioning, copy the **Internal Database URL**, **Username**, and **Password**
 
-1. **Build Command**: `cd frontend && npm install && npm run build`
-2. **Publish Directory**: `frontend/dist`
-3. **Routes**: Add a rewrite rule for all paths to serve `index.html` (SPA)
-4. **Environment**: Set `VITE_API_BASE_URL` to your Render backend URL (or use the proxy in dev)
+### Step 2: Deploy the Backend (Docker)
+
+1. Click **New +** → **Web Service**
+2. Connect your GitHub repo (`vetukurishivavarma-eng/InstaLego`)
+3. Fill in:
+   - **Name**: `instalego-backend`
+   - **Runtime**: Select **Docker** (not Java)
+   - **Branch**: `master`
+   - **Dockerfile Path**: `/backend/Dockerfile`
+   - **Plan**: Free
+
+4. Click **Advanced** and add these **Environment Variables**:
+
+   | Key | Value |
+   |-----|-------|
+   | `GEMINI_API_KEY` | `AIza...` (your Gemini key) |
+   | `DATABASE_URL` | The Internal Database URL from Step 1 |
+   | `DATABASE_USERNAME` | `instalego_user` |
+   | `DATABASE_PASSWORD` | The password from Step 1 |
+
+5. Click **Create Web Service**
+6. Wait for build & deploy (~5-8 mins)
+7. Copy your backend URL: `https://instalego-backend.onrender.com`
+
+### Step 3: Deploy the Frontend (Static Site)
+
+1. Click **New +** → **Static Site**
+2. Connect the same GitHub repo
+3. Fill in:
+   - **Name**: `instalego-frontend`
+   - **Branch**: `master`
+   - **Root Directory**: `frontend`
+   - **Build Command**: `npm install && npm run build`
+   - **Publish Directory**: `frontend/dist`
+
+4. Add a **Redirect/Rewrite Rule**:
+   - **Source**: `/*`
+   - **Destination**: `/index.html`
+   - **Action**: **Rewrite** (enables client-side routing)
+
+5. Click **Create Static Site**
+6. Your frontend URL: `https://instalego-frontend.onrender.com`
+
+### Summary
+
+| Service | Type | URL |
+|---------|------|-----|
+| PostgreSQL | Database | Internal to Render |
+| Backend | Docker | `https://instalego-backend.onrender.com` |
+| Frontend | Static Site | `https://instalego-frontend.onrender.com` |
+
+> ⚠️ Render's free tier spins down after 15 min of inactivity. First request after idle takes 30-60s to wake up.
 
 ---
 
