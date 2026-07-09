@@ -1,4 +1,6 @@
-const API_BASE = '/api';
+// In dev, Vite proxies /api to localhost:8080.
+// In production, set VITE_API_URL to the backend URL (e.g., https://instalego-backend.onrender.com)
+const API_BASE = (import.meta.env.VITE_API_URL || '') + '/api';
 
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
