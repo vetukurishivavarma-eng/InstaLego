@@ -27,7 +27,7 @@ spring:
 # File uploads directory
 app:
   upload-dir: ${UPLOAD_DIR:./uploads}
-  gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent
+  gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL:gemini-2.5-flash-lite}:generateContent
 
 ---
 # PostgreSQL configuration for production
