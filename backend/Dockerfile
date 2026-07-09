@@ -18,4 +18,4 @@ FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 EXPOSE 8080
-CMD ["java", "-jar", "app.jar", "--spring.profiles.active=prod"]
+CMD ["java", "-Xmx384m", "-XX:+UseSerialGC", "-jar", "app.jar", "--spring.profiles.active=prod"]
