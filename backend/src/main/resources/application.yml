@@ -36,10 +36,10 @@ spring:
     activate:
       on-profile: prod
   datasource:
-    url: jdbc:${DATABASE_URL}
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}
     driver-class-name: org.postgresql.Driver
-    username: ${DATABASE_USERNAME}
-    password: ${DATABASE_PASSWORD}
+    username: ${DB_USERNAME:${DATABASE_USERNAME}}
+    password: ${DB_PASSWORD:${DATABASE_PASSWORD}}
   jpa:
     properties:
       hibernate:
