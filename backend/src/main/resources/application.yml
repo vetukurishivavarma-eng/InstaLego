@@ -26,7 +26,7 @@ spring:
 
 # File uploads directory
 app:
-  upload-dir: ./uploads
+  upload-dir: ${UPLOAD_DIR:./uploads}
   gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent
 
 ---
@@ -47,3 +47,6 @@ spring:
   h2:
     console:
       enabled: false
+
+app:
+  upload-dir: ${UPLOAD_DIR:/app/uploads}
