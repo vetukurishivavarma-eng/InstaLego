@@ -1,0 +1,49 @@
+server:
+  port: 8080
+
+spring:
+  servlet:
+    multipart:
+      max-file-size: 15MB
+      max-request-size: 20MB
+  datasource:
+    url: jdbc:h2:file:./data/instalego
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.H2Dialect
+
+# File uploads directory
+app:
+  upload-dir: ./uploads
+  gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent
+
+---
+# PostgreSQL configuration for production
+spring:
+  config:
+    activate:
+      on-profile: prod
+  datasource:
+    url: ${DATABASE_URL}
+    driver-class-name: org.postgresql.Driver
+    username: ${DATABASE_USERNAME}
+    password: ${DATABASE_PASSWORD}
+  jpa:
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  h2:
+    console:
+      enabled: false
