@@ -4,8 +4,8 @@ server:
 spring:
   servlet:
     multipart:
-      max-file-size: -1
-      max-request-size: -1
+      max-file-size: 50MB
+      max-request-size: 55MB
   datasource:
     url: jdbc:h2:file:./data/instalego
     driver-class-name: org.h2.Driver

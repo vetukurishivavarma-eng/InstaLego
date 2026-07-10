@@ -42,14 +42,23 @@ public class ConversionService {
     @Lazy
     private ConversionService self;
 
+    private static final long MAX_FILE_SIZE_BYTES = 50L * 1024 * 1024; // 50 MB
+
     @Value("${app.upload-dir}")
     private String uploadDir;
 
     /**
      * Create a conversion job and return it immediately.
      */
+
     @Transactional
     public ConversionJob createJob(Long bankId, MultipartFile file) throws IOException {
+        // Validate file size early — before any processing
+        if (file.getSize() > MAX_FILE_SIZE_BYTES) {
+            throw new IllegalArgumentException(
+                    "File too large: " + (file.getSize() / (1024 * 1024)) + " MB. Maximum allowed: 50 MB.");
+        }
+
         // Validate file type
         String contentType = file.getContentType();
         String sourceFileType = determineFileType(contentType, file.getOriginalFilename());
@@ -147,6 +156,13 @@ public class ConversionService {
             jobRepository.save(job);
 
             log.info("Job {} completed successfully. Output: {}", jobId, outputPath);
+
+            // Clean up source file after successful processing to free disk space
+            try {
+                Files.deleteIfExists(Path.of(job.getSourceFilePath()));
+            } catch (IOException e) {
+                log.warn("Could not delete source file for job {}: {}", jobId, e.getMessage());
+            }
 
         } catch (Exception e) {
             log.error("Job {} failed", jobId, e);
