@@ -42,7 +42,10 @@ public class ConversionService {
     @Lazy
     private ConversionService self;
 
-    private static final long MAX_FILE_SIZE_BYTES = 50L * 1024 * 1024; // 50 MB
+    private static final long MAX_FILE_SIZE_BYTES = 15L * 1024 * 1024; // 15 MB
+
+    // Shared Tika instance to avoid per-call parser loading overhead
+    private static final Tika TIKA = new Tika();
 
     @Value("${app.upload-dir}")
     private String uploadDir;
@@ -56,7 +59,7 @@ public class ConversionService {
         // Validate file size early — before any processing
         if (file.getSize() > MAX_FILE_SIZE_BYTES) {
             throw new IllegalArgumentException(
-                    "File too large: " + (file.getSize() / (1024 * 1024)) + " MB. Maximum allowed: 50 MB.");
+                    "File too large: " + (file.getSize() / (1024 * 1024)) + " MB. Maximum allowed: 15 MB.");
         }
 
         // Validate file type
@@ -129,14 +132,20 @@ public class ConversionService {
                 provider = "Groq";
                 log.info("Job {}: text extraction yielded {} chars, routing to {}", jobId, extractedText.length(), provider);
                 extractionResult = groqClient.extractFieldsFromText(extractedText, fieldSchema);
+                // Clear extracted text from memory now that it's been sent to Groq
+                extractedText = null;
             } else {
                 // Scanned/image-only pages → send page images to Gemini vision
                 provider = "Gemini";
                 log.info("Job {}: no extractable text, routing to Gemini vision fallback", jobId);
                 byte[] fileBytes = Files.readAllBytes(Path.of(job.getSourceFilePath()));
                 String base64Data = Base64.getEncoder().encodeToString(fileBytes);
+                // Clear raw bytes immediately — Base64 string is all we need
+                fileBytes = null;
                 String mimeType = getMimeTypeForFileType(job.getSourceFileType());
                 extractionResult = geminiService.extractFields(base64Data, mimeType, fieldSchema);
+                // Clear Base64 data from memory now that Gemini has processed it
+                base64Data = null;
             }
 
             log.info("Job {} served by provider: {} using model: {}", jobId, provider,
@@ -257,10 +266,9 @@ public class ConversionService {
      * Extract text from non-PDF files (DOCX, etc.) using Apache Tika.
      */
     private String extractTextWithTika(Path filePath) throws IOException {
-        Tika tika = new Tika();
         try (InputStream is = new FileInputStream(filePath.toFile())) {
             try {
-                String text = tika.parseToString(is);
+                String text = TIKA.parseToString(is);
                 return text != null ? text.trim() : null;
             } catch (org.apache.tika.exception.TikaException e) {
                 throw new IOException("Tika text extraction failed", e);

@@ -13,8 +13,8 @@ public class AsyncConfig implements AsyncConfigurer {
     public Executor getAsyncExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(1);
-        executor.setMaxPoolSize(2);
-        executor.setQueueCapacity(5);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(10);
         executor.setThreadNamePrefix("instalego-async-");
         executor.initialize();
         return executor;
