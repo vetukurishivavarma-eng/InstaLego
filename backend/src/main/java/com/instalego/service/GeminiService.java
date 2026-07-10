@@ -28,6 +28,20 @@ public class GeminiService {
     @Value("${app.gemini-api-url}")
     private String geminiApiUrl;
 
+    /**
+     * Expose the configured model name for logging purposes.
+     */
+    public String getModel() {
+        // Extract model name from URL: /models/{MODEL_NAME}:generateContent
+        if (geminiApiUrl != null && geminiApiUrl.contains("/models/")) {
+            String afterModels = geminiApiUrl.substring(geminiApiUrl.indexOf("/models/") + 8);
+            return afterModels.contains(":generateContent")
+                    ? afterModels.substring(0, afterModels.indexOf(":generateContent"))
+                    : afterModels;
+        }
+        return "unknown";
+    }
+
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .build();

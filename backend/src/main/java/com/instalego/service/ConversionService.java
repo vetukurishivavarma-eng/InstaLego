@@ -6,6 +6,10 @@ import com.instalego.model.ConversionJob;
 import com.instalego.repository.ConversionJobRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.tika.Tika;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
@@ -15,7 +19,9 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -28,6 +34,7 @@ public class ConversionService {
     private final ConversionJobRepository jobRepository;
     private final TemplateService templateService;
     private final GeminiService geminiService;
+    private final GroqClient groqClient;
     private final PdfGenerationService pdfGenerationService;
     private final ObjectMapper objectMapper;
 
@@ -97,20 +104,34 @@ public class ConversionService {
             BankTemplate template = templateService.getActiveTemplate(job.getBankId())
                     .orElseThrow(() -> new IllegalStateException("No active template found for bank " + job.getBankId()));
 
-            // Read the source file and encode to base64
-            byte[] fileBytes = Files.readAllBytes(Path.of(job.getSourceFilePath()));
-            String base64Data = Base64.getEncoder().encodeToString(fileBytes);
-            String mimeType = getMimeTypeForFileType(job.getSourceFileType());
-
-            log.info("Processing job {}: calling Gemini for extraction (bankId={})", jobId, job.getBankId());
-
-            // Call Gemini to extract fields
             String fieldSchema = template.getFieldSchema();
             if (fieldSchema == null || fieldSchema.isBlank() || "[]".equals(fieldSchema)) {
                 throw new IllegalStateException("Bank template has no field schema configured");
             }
 
-            Map<String, Object> extractionResult = geminiService.extractFields(base64Data, mimeType, fieldSchema);
+            // Phase 1: Attempt text extraction using PDFBox/Tika (code-first approach)
+            String extractedText = extractTextFromFile(Path.of(job.getSourceFilePath()), job.getSourceFileType());
+
+            Map<String, Object> extractionResult;
+            String provider;
+
+            if (extractedText != null && !extractedText.isBlank()) {
+                // Text-native document → send extracted text to Groq
+                provider = "Groq";
+                log.info("Job {}: text extraction yielded {} chars, routing to {}", jobId, extractedText.length(), provider);
+                extractionResult = groqClient.extractFieldsFromText(extractedText, fieldSchema);
+            } else {
+                // Scanned/image-only pages → send page images to Gemini vision
+                provider = "Gemini";
+                log.info("Job {}: no extractable text, routing to Gemini vision fallback", jobId);
+                byte[] fileBytes = Files.readAllBytes(Path.of(job.getSourceFilePath()));
+                String base64Data = Base64.getEncoder().encodeToString(fileBytes);
+                String mimeType = getMimeTypeForFileType(job.getSourceFileType());
+                extractionResult = geminiService.extractFields(base64Data, mimeType, fieldSchema);
+            }
+
+            log.info("Job {} served by provider: {} using model: {}", jobId, provider,
+                    "Groq".equals(provider) ? groqClient.getModel() : geminiService.getModel());
 
             String extractedJson = objectMapper.writeValueAsString(extractionResult);
             job.setExtractedJson(extractedJson);
@@ -175,5 +196,55 @@ public class ConversionService {
             case "DOCX" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
             default -> "application/octet-stream";
         };
+    }
+
+    /**
+     * Extract plain text from a source file using PDFBox (for PDFs) or Apache Tika (for DOCX/images).
+     * Returns null if text extraction fails or yields empty text (e.g., scanned pages).
+     */
+    private String extractTextFromFile(Path filePath, String fileType) {
+        try {
+            return switch (fileType.toUpperCase()) {
+                case "PDF" -> extractTextFromPdf(filePath);
+                case "DOCX" -> extractTextWithTika(filePath);
+                case "IMAGE" -> null; // Images have no native text — always fall back to vision
+                default -> extractTextWithTika(filePath);
+            };
+        } catch (Exception e) {
+            log.warn("Text extraction failed for {} ({}): {}", filePath, fileType, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Extract text from a PDF using PDFBox's built-in stripper.
+     */
+    private String extractTextFromPdf(Path pdfPath) throws IOException {
+        try (PDDocument document = Loader.loadPDF(pdfPath.toFile())) {
+            PDFTextStripper stripper = new PDFTextStripper();
+            String text = stripper.getText(document);
+            if (text != null) {
+                text = text.trim();
+            }
+            // If the extracted text is very short relative to file size, it's likely a scanned PDF
+            long fileSize = Files.size(pdfPath);
+            if (text == null || text.isEmpty() || (fileSize > 1024 && text.length() < 50)) {
+                log.debug("PDF appears to be scanned or image-only ({} bytes, {} chars extracted)", fileSize,
+                        text != null ? text.length() : 0);
+                return null;
+            }
+            return text;
+        }
+    }
+
+    /**
+     * Extract text from non-PDF files (DOCX, etc.) using Apache Tika.
+     */
+    private String extractTextWithTika(Path filePath) throws IOException {
+        Tika tika = new Tika();
+        try (InputStream is = new FileInputStream(filePath.toFile())) {
+            String text = tika.parseToString(is);
+            return text != null ? text.trim() : null;
+        }
     }
 }

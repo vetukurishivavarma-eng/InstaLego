@@ -28,6 +28,8 @@ spring:
 app:
   upload-dir: ${UPLOAD_DIR:./uploads}
   gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL:gemini-3.5-flash}:generateContent
+  groq-api-url: ${GROQ_API_URL:https://api.groq.com/openai/v1/chat/completions}
+  groq-model: ${GROQ_MODEL:llama-3.3-70b-versatile}
 
 ---
 # PostgreSQL configuration for production
