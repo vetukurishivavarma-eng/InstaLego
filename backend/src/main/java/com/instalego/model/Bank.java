@@ -20,6 +20,12 @@ public class Bank {
     @Column(nullable = false, unique = true)
     private String name;
 
+    @Column(name = "report_template_path")
+    private String reportTemplatePath; // Path to the sample report PDF uploaded by admin
+
+    @Column(name = "report_structure", columnDefinition = "TEXT")
+    private String reportStructure; // Structure description derived by Gemini from the sample report
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 

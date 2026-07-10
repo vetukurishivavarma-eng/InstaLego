@@ -173,4 +173,61 @@ export const api = {
     });
     return handleResponse<any>(res);
   },
+
+  // Multi-Document Verification
+  async startVerification(bankId: number): Promise<any> {
+    const formData = new FormData();
+    formData.append('bankId', bankId.toString());
+    const res = await fetch(`${API_BASE}/verify/start`, {
+      method: 'POST',
+      body: formData,
+    });
+    return handleResponse<any>(res);
+  },
+
+  async addVerificationDocument(sessionId: number, file: File, label: string): Promise<any> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('label', label);
+    const res = await fetch(`${API_BASE}/verify/${sessionId}/add-document`, {
+      method: 'POST',
+      body: formData,
+    });
+    return handleResponse<any>(res);
+  },
+
+  async getVerificationStatus(sessionId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/verify/${sessionId}`);
+    return handleResponse<any>(res);
+  },
+
+  async runVerification(sessionId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/verify/${sessionId}/run`, {
+      method: 'POST',
+    });
+    return handleResponse<any>(res);
+  },
+
+  // Report Format (Admin)
+  async uploadReportFormat(bankId: number, file: File): Promise<any> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/banks/${bankId}/report-format`, {
+      method: 'POST',
+      body: formData,
+    });
+    return handleResponse<any>(res);
+  },
+
+  async getReportFormat(bankId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/banks/${bankId}/report-format`);
+    return handleResponse<any>(res);
+  },
+
+  async deleteReportFormat(bankId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/banks/${bankId}/report-format`, {
+      method: 'DELETE',
+    });
+    return handleResponse<any>(res);
+  },
 };
