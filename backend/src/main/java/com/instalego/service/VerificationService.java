@@ -9,7 +9,6 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.tika.Tika;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.io.FileInputStream;
 import java.io.InputStream;
@@ -31,8 +30,8 @@ public class VerificationService {
     /**
      * Run verification on all documents in a job.
      * Uses a SINGLE Groq API call with all document texts in one optimized prompt.
+     * Transactional boundary is managed by the caller (VerificationController.runAsyncVerification).
      */
-    @Transactional
     public VerificationJob runVerification(Long jobId) {
         VerificationJob job = jobRepository.findById(jobId)
                 .orElseThrow(() -> new IllegalArgumentException("Job not found: " + jobId));

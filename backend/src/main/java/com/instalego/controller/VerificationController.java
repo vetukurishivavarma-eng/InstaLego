@@ -11,6 +11,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -232,7 +234,10 @@ public class VerificationController {
 
     /**
      * Async verification that respects Spring's @Transactional proxy.
+     * Called through 'self' to ensure both @Async and @Transactional are active.
      */
+    @Async
+    @Transactional
     public void runAsyncVerification(Long jobId) {
         try {
             verificationService.runVerification(jobId);
