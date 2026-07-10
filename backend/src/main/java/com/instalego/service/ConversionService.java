@@ -35,6 +35,7 @@ public class ConversionService {
     private final TemplateService templateService;
     private final GeminiService geminiService;
     private final GroqClient groqClient;
+    private final VerificationService verificationService;
     private final PdfGenerationService pdfGenerationService;
     private final ObjectMapper objectMapper;
 
@@ -161,6 +162,24 @@ public class ConversionService {
                     template.getTemplatePdfPath(), extractedJson, outputDir);
 
             job.setOutputFilePath(outputPath.toString());
+
+            // Run legal verification against bank's reference documents
+            log.info("Running legal verification for job {} against bank {} policies", jobId, job.getBankId());
+            try {
+                Map<String, Object> verificationResult = verificationService.verifyDocument(extractedJson, job.getBankId());
+                String verificationReportJson = objectMapper.writeValueAsString(verificationResult);
+                job.setVerificationReport(verificationReportJson);
+                log.info("Legal verification complete for job {}: {}", jobId,
+                        verificationResult.getOrDefault("summaryVerdict", "No verdict"));
+            } catch (Exception e) {
+                log.warn("Legal verification failed for job {}, continuing without it: {}", jobId, e.getMessage());
+                Map<String, Object> fallback = new HashMap<>();
+                fallback.put("summaryVerdict", "Verification could not be completed due to an error.");
+                fallback.put("detailedFindings", List.of());
+                fallback.put("confidence", "Low");
+                job.setVerificationReport(objectMapper.writeValueAsString(fallback));
+            }
+
             job.setStatus(ConversionJob.Status.DONE);
             jobRepository.save(job);
 

@@ -77,7 +77,23 @@ public class GroqClient {
         return parseExtractionResponse(response);
     }
 
+    /**
+     * Send a custom prompt to Groq with a custom system message.
+     * Used by VerificationService and other non-extraction flows.
+     *
+     * @param systemMessage The system-level instruction for the model
+     * @param userPrompt    The user message content
+     * @return Raw response text from the model
+     */
+    public String sendPrompt(String systemMessage, String userPrompt) {
+        return callGroqInternal(systemMessage, userPrompt);
+    }
+
     private String callGroq(String prompt) {
+        return callGroqInternal("You are a precise document processing engine. Always return valid JSON only.", prompt);
+    }
+
+    private String callGroqInternal(String systemMessage, String userMessage) {
         String apiKey = System.getenv("GROQ_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException("GROQ_API_KEY environment variable is not set");
@@ -93,12 +109,12 @@ public class GroqClient {
             // System message
             ObjectNode sysMsg = messages.addObject();
             sysMsg.put("role", "system");
-            sysMsg.put("content", "You are a precise document processing engine. Always return valid JSON only.");
+            sysMsg.put("content", systemMessage);
 
             // User message
             ObjectNode userMsg = messages.addObject();
             userMsg.put("role", "user");
-            userMsg.put("content", prompt);
+            userMsg.put("content", userMessage);
 
             // Response format (JSON object mode)
             ObjectNode responseFormat = requestBody.putObject("response_format");
@@ -110,7 +126,9 @@ public class GroqClient {
 
             String requestJson = objectMapper.writeValueAsString(requestBody);
 
-            log.debug("Groq API request (truncated prompt): prompt={}...", prompt.substring(0, Math.min(200, prompt.length())));
+            log.debug("Groq API request (truncated): system={}, prompt={}...",
+                    systemMessage.substring(0, Math.min(100, systemMessage.length())),
+                    userMessage.substring(0, Math.min(200, userMessage.length())));
 
             // Retry logic with exponential backoff (handles 429 rate limits)
             int maxRetries = 3;

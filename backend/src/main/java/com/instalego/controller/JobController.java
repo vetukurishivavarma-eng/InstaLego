@@ -67,6 +67,7 @@ public class JobController {
                     .bankName(bankName)
                     .status(job.getStatus().name())
                     .extractedJson(job.getExtractedJson())
+                    .verificationReport(job.getVerificationReport())
                     .errorMessage(job.getErrorMessage())
                     .outputAvailable(job.getOutputFilePath() != null)
                     .createdAt(job.getCreatedAt() != null ? job.getCreatedAt().toString() : null)

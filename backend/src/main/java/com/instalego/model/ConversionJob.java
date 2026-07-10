@@ -40,6 +40,9 @@ public class ConversionJob {
     @Column(name = "output_file_path")
     private String outputFilePath;
 
+    @Column(name = "verification_report", columnDefinition = "TEXT")
+    private String verificationReport; // JSON — verification findings against bank legal references
+
     @Column(name = "error_message", columnDefinition = "TEXT")
     private String errorMessage;
 

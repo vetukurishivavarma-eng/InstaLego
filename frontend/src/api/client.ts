@@ -47,12 +47,21 @@ export interface BankTemplate {
   createdAt: string;
 }
 
+export interface LegalReference {
+  id: number;
+  bankId: number;
+  fileName: string;
+  fileType: string;
+  createdAt: string;
+}
+
 export interface JobStatusResponse {
   id: number;
   bankId: number;
   bankName: string;
   status: string;
   extractedJson: string | null;
+  verificationReport: string | null;
   errorMessage: string | null;
   outputAvailable: boolean;
   createdAt: string;
@@ -140,5 +149,28 @@ export const api = {
 
   getJobOutputUrl(jobId: number): string {
     return `${API_BASE}/jobs/${jobId}/output`;
+  },
+
+  // Legal References
+  async uploadReference(bankId: number, file: File): Promise<LegalReference> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/banks/${bankId}/references`, {
+      method: 'POST',
+      body: formData,
+    });
+    return handleResponse<LegalReference>(res);
+  },
+
+  async getReferences(bankId: number): Promise<LegalReference[]> {
+    const res = await fetch(`${API_BASE}/banks/${bankId}/references`);
+    return handleResponse<LegalReference[]>(res);
+  },
+
+  async deleteReference(bankId: number, referenceId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/banks/${bankId}/references/${referenceId}`, {
+      method: 'DELETE',
+    });
+    return handleResponse<any>(res);
   },
 };

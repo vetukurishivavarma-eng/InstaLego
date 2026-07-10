@@ -224,6 +224,92 @@ export default function UserPage() {
                 Document processed successfully!
               </div>
 
+              {/* Verification Report */}
+              {jobStatus.verificationReport && (() => {
+                try {
+                  const report = JSON.parse(jobStatus.verificationReport);
+                  const summary = report.summaryVerdict || 'No summary available';
+                  const findings = report.detailedFindings || [];
+                  const confidence = report.confidence || 'N/A';
+
+                  const verdictLower = summary.toLowerCase();
+                  const verdictColor = summary.includes('✅') || verdictLower.includes('compliant')
+                    ? 'var(--success)' : summary.includes('⚠️') || verdictLower.includes('issue') || verdictLower.includes('non')
+                    ? 'var(--warning)' : 'var(--danger)';
+
+                  return (
+                    <div className="card" style={{ marginBottom: '1rem', padding: '1rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
+                        <h3 style={{ fontSize: '1rem', fontWeight: 600 }}>Legal Verification</h3>
+                        <span style={{
+                          fontSize: '0.75rem', padding: '0.25rem 0.625rem',
+                          borderRadius: '9999px', background: '#f3f4f6', color: 'var(--gray-600)',
+                          fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.025em'
+                        }}>
+                          Confidence: {confidence}
+                        </span>
+                      </div>
+
+                      <div style={{
+                        padding: '0.75rem 1rem', borderRadius: 'var(--radius)',
+                        background: `${verdictColor}08`, border: `1px solid ${verdictColor}30`,
+                        marginBottom: '1rem', fontWeight: 500, fontSize: '0.9375rem',
+                        color: verdictColor
+                      }}>
+                        {summary}
+                      </div>
+
+                      {findings.length > 0 && (
+                        <>
+                          <label style={{ fontWeight: 600, fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.5rem', display: 'block' }}>
+                            Detailed Findings
+                          </label>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.625rem' }}>
+                            {findings.map((f: any, i: number) => {
+                              const statusColor = f.status === 'COMPLIANT' ? 'var(--success)'
+                                : f.status === 'NON_COMPLIANT' ? 'var(--danger)'
+                                : 'var(--gray-500)';
+                              return (
+                                <div key={i} style={{
+                                  padding: '0.75rem', borderRadius: 'var(--radius)',
+                                  border: '1px solid var(--gray-200)', background: 'var(--gray-50)'
+                                }}>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
+                                    <span style={{ fontWeight: 600, fontSize: '0.875rem' }}>{f.area}</span>
+                                    <span style={{
+                                      fontSize: '0.75rem', fontWeight: 600, padding: '0.125rem 0.5rem',
+                                      borderRadius: '9999px', background: `${statusColor}15`,
+                                      color: statusColor
+                                    }}>{f.status}</span>
+                                  </div>
+                                  {f.finding && (
+                                    <p style={{ fontSize: '0.8125rem', color: 'var(--gray-600)', marginBottom: '0.25rem' }}>
+                                      <span style={{ fontWeight: 500 }}>Found:</span> {f.finding}
+                                    </p>
+                                  )}
+                                  {f.requirement && (
+                                    <p style={{ fontSize: '0.8125rem', color: 'var(--gray-600)', marginBottom: '0.25rem' }}>
+                                      <span style={{ fontWeight: 500 }}>Required:</span> {f.requirement}
+                                    </p>
+                                  )}
+                                  {f.detail && (
+                                    <p style={{ fontSize: '0.8125rem', color: 'var(--gray-500)', fontStyle: 'italic' }}>
+                                      {f.detail}
+                                    </p>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                } catch {
+                  return null;
+                }
+              })()}
+
               {jobStatus.extractedJson && (
                 <div className="form-group">
                   <label>Extracted Data (preview)</label>

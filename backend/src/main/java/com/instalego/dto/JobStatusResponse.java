@@ -5,9 +5,6 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-import java.util.List;
-import java.util.Map;
-
 @Data
 @Builder
 @NoArgsConstructor
@@ -18,6 +15,7 @@ public class JobStatusResponse {
     private String bankName;
     private String status;
     private String extractedJson;
+    private String verificationReport;
     private String errorMessage;
     private boolean outputAvailable;
     private String createdAt;

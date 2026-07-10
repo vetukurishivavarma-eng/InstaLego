@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { api, Bank, FieldSchemaEntry, TemplateUploadResponse, BankTemplate } from '../api/client';
+import { api, Bank, FieldSchemaEntry, TemplateUploadResponse, BankTemplate, LegalReference } from '../api/client';
 
 export default function AdminPage() {
   const [banks, setBanks] = useState<Bank[]>([]);
@@ -20,6 +20,12 @@ export default function AdminPage() {
   const [bankTemplate, setBankTemplate] = useState<BankTemplate | null>(null);
   const [loadingTemplate, setLoadingTemplate] = useState(false);
 
+  // Legal References state
+  const [references, setReferences] = useState<LegalReference[]>([]);
+  const [loadingRefs, setLoadingRefs] = useState(false);
+  const [refUploadFile, setRefUploadFile] = useState<File | null>(null);
+  const [uploadingRef, setUploadingRef] = useState(false);
+
   const loadBanks = useCallback(async () => {
     try {
       setError('');
@@ -36,10 +42,11 @@ export default function AdminPage() {
     loadBanks();
   }, [loadBanks]);
 
-  // Load template details when viewing a bank
+  // Load template and references when viewing a bank
   useEffect(() => {
     if (viewingBank) {
       loadTemplate(viewingBank.id);
+      loadReferences(viewingBank.id);
     }
   }, [viewingBank]);
 
@@ -52,6 +59,47 @@ export default function AdminPage() {
       setBankTemplate(null);
     } finally {
       setLoadingTemplate(false);
+    }
+  };
+
+  const loadReferences = async (bankId: number) => {
+    setLoadingRefs(true);
+    try {
+      const refs = await api.getReferences(bankId);
+      setReferences(refs);
+    } catch {
+      setReferences([]);
+    } finally {
+      setLoadingRefs(false);
+    }
+  };
+
+  const handleUploadReference = async () => {
+    if (!viewingBank || !refUploadFile) return;
+    setUploadingRef(true);
+    setError('');
+    try {
+      await api.uploadReference(viewingBank.id, refUploadFile);
+      setRefUploadFile(null);
+      await loadReferences(viewingBank.id);
+      setSuccess(`Reference document "${refUploadFile.name}" uploaded.`);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setUploadingRef(false);
+    }
+  };
+
+  const handleDeleteReference = async (ref: LegalReference) => {
+    if (!window.confirm(`Delete "${ref.fileName}"? This cannot be undone.`)) return;
+    try {
+      setError('');
+      setSuccess('');
+      await api.deleteReference(ref.bankId, ref.id);
+      await loadReferences(ref.bankId);
+      setSuccess(`Reference "${ref.fileName}" deleted.`);
+    } catch (e: any) {
+      setError(e.message);
     }
   };
 
@@ -345,6 +393,93 @@ export default function AdminPage() {
               </button>
             </div>
           )}
+
+          {/* Legal References Section */}
+          <div style={{ marginTop: '2rem', borderTop: '1px solid var(--gray-200)', paddingTop: '1.5rem' }}>
+            <h2 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>
+              Legal References — {viewingBank.name}
+            </h2>
+            <p style={{ fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.75rem' }}>
+              Upload bank policies, regulatory guidelines, or legal requirements. These are used to verify user-submitted documents.
+            </p>
+
+            {/* Upload reference doc */}
+            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', alignItems: 'flex-end' }}>
+              <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                <div
+                  className={`file-upload-area`}
+                  style={{ padding: '1rem', cursor: 'pointer' }}
+                  onClick={() => document.getElementById('ref-file-input')?.click()}
+                >
+                  <input
+                    id="ref-file-input"
+                    type="file"
+                    accept=".pdf,.txt,.docx"
+                    onChange={e => setRefUploadFile(e.target.files?.[0] || null)}
+                  />
+                  {refUploadFile ? (
+                    <p style={{ fontWeight: 600, color: 'var(--success)', fontSize: '0.875rem' }}>
+                      ✓ {refUploadFile.name}
+                    </p>
+                  ) : (
+                    <p style={{ color: 'var(--gray-500)', fontSize: '0.8125rem' }}>
+                      Click to select PDF, DOCX, or TXT
+                    </p>
+                  )}
+                </div>
+              </div>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleUploadReference}
+                disabled={!refUploadFile || uploadingRef}
+              >
+                {uploadingRef ? <><span className="spinner" /> Uploading...</> : 'Upload Reference'}
+              </button>
+            </div>
+
+            {/* List of uploaded references */}
+            {loadingRefs ? (
+              <div style={{ padding: '0.75rem 0' }}><span className="spinner" /> Loading references...</div>
+            ) : references.length === 0 ? (
+              <p style={{ color: 'var(--gray-500)', fontSize: '0.875rem', fontStyle: 'italic' }}>
+                No legal reference documents uploaded yet.
+              </p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                {references.map(ref => (
+                  <div
+                    key={ref.id}
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      padding: '0.625rem 0.75rem', background: 'var(--gray-50)',
+                      borderRadius: 'var(--radius)', border: '1px solid var(--gray-200)',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--gray-500)"
+                           strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                      </svg>
+                      <div>
+                        <p style={{ fontWeight: 500, fontSize: '0.875rem' }}>{ref.fileName}</p>
+                        <p style={{ fontSize: '0.75rem', color: 'var(--gray-400)' }}>
+                          {ref.fileType} — {ref.createdAt ? new Date(ref.createdAt).toLocaleDateString() : ''}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      className="btn btn-danger btn-sm"
+                      style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
+                      onClick={() => handleDeleteReference(ref)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
 
           <button
             className="btn btn-secondary btn-sm"
