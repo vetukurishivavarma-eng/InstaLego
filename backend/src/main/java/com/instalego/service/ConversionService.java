@@ -243,8 +243,12 @@ public class ConversionService {
     private String extractTextWithTika(Path filePath) throws IOException {
         Tika tika = new Tika();
         try (InputStream is = new FileInputStream(filePath.toFile())) {
-            String text = tika.parseToString(is);
-            return text != null ? text.trim() : null;
+            try {
+                String text = tika.parseToString(is);
+                return text != null ? text.trim() : null;
+            } catch (org.apache.tika.exception.TikaException e) {
+                throw new IOException("Tika text extraction failed", e);
+            }
         }
     }
 }
