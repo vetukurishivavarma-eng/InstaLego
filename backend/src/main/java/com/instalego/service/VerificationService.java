@@ -12,6 +12,7 @@ import org.springframework.stereotype.Service;
 
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 
@@ -23,6 +24,7 @@ public class VerificationService {
     private final VerificationJobRepository jobRepository;
     private final BankService bankService;
     private final GroqClient groqClient;
+    private final GeminiService geminiService;
     private final ObjectMapper objectMapper;
 
     private static final Tika TIKA = new Tika();
@@ -60,6 +62,16 @@ public class VerificationService {
 
                 String extractedText = extractText(Path.of(filePath), fileType);
                 String label = (String) doc.getOrDefault("label", fileName);
+
+                // If normal text extraction found nothing (typical for scanned/image-only PDFs
+                // or photos, which have no embedded text layer), fall back to AI OCR via Gemini.
+                if ((extractedText == null || extractedText.isBlank()) && isOcrEligible(fileType)) {
+                    String ocrText = tryGeminiOcr(Path.of(filePath), fileType);
+                    if (ocrText != null && !ocrText.isBlank()) {
+                        extractedText = ocrText;
+                        thinkingSteps.add("🔎 Used AI vision (Gemini) to read scanned/image content from \"" + label + "\"");
+                    }
+                }
 
                 if (extractedText != null && !extractedText.isBlank()) {
                     allDocsText.append("--- Document ").append(i + 1).append(": \"").append(label).append("\" ---\n");
@@ -384,6 +396,35 @@ public class VerificationService {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private boolean isOcrEligible(String fileType) {
+        String ext = fileType != null ? fileType.toUpperCase() : "";
+        return "PDF".equals(ext) || "IMAGE".equals(ext);
+    }
+
+    /**
+     * Sends the raw file to Gemini's multimodal model to transcribe visible text, for documents
+     * where PDFBox/Tika found no embedded text layer (e.g. scans or photos of documents).
+     */
+    private String tryGeminiOcr(Path filePath, String fileType) {
+        try {
+            byte[] bytes = Files.readAllBytes(filePath);
+            String base64 = Base64.getEncoder().encodeToString(bytes);
+            String mimeType = "PDF".equalsIgnoreCase(fileType) ? "application/pdf" : guessImageMimeType(filePath);
+            return geminiService.extractRawText(base64, mimeType);
+        } catch (Exception e) {
+            log.warn("Gemini OCR fallback failed for {}: {}", filePath, e.getMessage());
+            return null;
+        }
+    }
+
+    private String guessImageMimeType(Path filePath) {
+        String name = filePath.getFileName().toString().toLowerCase();
+        if (name.endsWith(".png")) return "image/png";
+        if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+        if (name.endsWith(".webp")) return "image/webp";
+        return "image/jpeg";
     }
 
     private String extractText(Path filePath, String fileType) {

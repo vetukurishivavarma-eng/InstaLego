@@ -100,6 +100,44 @@ public class GeminiService {
         return parseExtractionResponse(response);
     }
 
+    /**
+     * OCR-style fallback: ask Gemini to transcribe all visible text from a document.
+     * Used when standard text extraction (PDFBox/Tika) fails — typically because the file is a
+     * scanned/image-only PDF or a photo, which have no embedded text layer for those libraries
+     * to read. Gemini's multimodal model can read the pixels directly instead.
+     *
+     * @param base64File Base64-encoded file bytes
+     * @param mimeType   e.g. "application/pdf", "image/jpeg", "image/png"
+     * @return The transcribed plain text, or an empty string if nothing could be read
+     */
+    public String extractRawText(String base64File, String mimeType) {
+        String prompt = """
+                You are a precise OCR/transcription engine. Read the provided document (which may be a
+                scanned image, photograph, or image-only PDF) and transcribe ALL visible text exactly as
+                it appears, preserving structure (paragraphs, line breaks) as best you can. Do not
+                summarize, translate, explain, or add commentary — only transcribe the actual text content.
+                If the document contains no readable text at all, return an empty string.
+
+                Return ONLY valid JSON in this exact shape:
+                {
+                  "extractedText": "<the full transcribed text, or empty string if none found>"
+                }
+                No markdown fences, no preamble — JSON only.
+                """;
+
+        String response = callGemini(prompt, base64File, mimeType);
+        try {
+            JsonNode node = objectMapper.readTree(response);
+            if (node.has("extractedText")) {
+                return node.get("extractedText").asText();
+            }
+            return response;
+        } catch (Exception e) {
+            log.warn("Failed to parse Gemini OCR response as JSON, returning raw text instead: {}", e.getMessage());
+            return response;
+        }
+    }
+
     private String callGemini(String prompt, String base64Data, String mimeType) {
         String apiKey = System.getenv("GEMINI_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
