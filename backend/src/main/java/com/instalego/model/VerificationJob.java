@@ -57,6 +57,21 @@ public class VerificationJob {
     @Column(name = "error_message", columnDefinition = "TEXT")
     private String errorMessage;
 
+    /**
+     * Combined plain text extracted from all uploaded documents. Kept around (rather than
+     * discarded after the initial analysis) so follow-up chat questions can be answered
+     * without re-uploading or re-extracting the documents.
+     */
+    @Column(name = "extracted_text", columnDefinition = "TEXT")
+    private String extractedText;
+
+    /**
+     * JSON array of the follow-up Q&A chat exchanged after the initial report:
+     * [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}, ...]
+     */
+    @Column(name = "chat_history_json", columnDefinition = "TEXT")
+    private String chatHistoryJson = "[]";
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 

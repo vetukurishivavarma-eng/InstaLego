@@ -1,7 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { api, Bank } from '../api/client';
 
 const POLL_INTERVAL_MS = 1500;
+
+interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
 
 export default function UserPage() {
   const [banks, setBanks] = useState<Bank[]>([]);
@@ -17,6 +24,13 @@ export default function UserPage() {
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [report, setReport] = useState<any>(null);
   const [documents, setDocuments] = useState<any[]>([]);
+
+  // Chat state (follow-up Q&A once the report is ready)
+  const [chatHistory, setChatHistory] = useState<ChatTurn[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [asking, setAsking] = useState(false);
+  const [chatError, setChatError] = useState('');
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
   // Upload state
   const [uploadFile, setUploadFile] = useState<File | null>(null);
@@ -60,6 +74,9 @@ export default function UserPage() {
 
           if (status.status === 'DONE' && status.report) {
             setReport(status.report);
+            if (Array.isArray(status.chatHistory)) {
+              setChatHistory(status.chatHistory);
+            }
             if (pollRef.current) clearInterval(pollRef.current);
           }
 
@@ -149,8 +166,42 @@ export default function UserPage() {
     setUploadLabel('');
     setSuccess('');
     setError('');
+    setChatHistory([]);
+    setChatInput('');
+    setChatError('');
     if (pollRef.current) clearInterval(pollRef.current);
   };
+
+  const handleAskQuestion = async () => {
+    const question = chatInput.trim();
+    if (!sessionId || !question || asking) return;
+
+    setChatError('');
+    setChatInput('');
+    setAsking(true);
+    // Optimistically show the user's question right away
+    setChatHistory(prev => [...prev, { role: 'user', content: question }]);
+
+    try {
+      const result = await api.askVerification(sessionId, question);
+      if (Array.isArray(result.chatHistory)) {
+        setChatHistory(result.chatHistory);
+      } else if (result.answer) {
+        setChatHistory(prev => [...prev, { role: 'assistant', content: result.answer }]);
+      }
+    } catch (e: any) {
+      setChatError(e.message || 'Failed to get an answer. Please try again.');
+      // Roll back the optimistic user turn since it wasn't answered
+      setChatHistory(prev => prev.slice(0, -1));
+      setChatInput(question);
+    } finally {
+      setAsking(false);
+    }
+  };
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [chatHistory, asking]);
 
   const getStatusBadge = (status: string) => {
     const cls =
@@ -400,23 +451,99 @@ export default function UserPage() {
             {report.verdict && getVerdictBadge(report.verdict)}
           </div>
 
-          {/* Overall Verdict */}
-          {report.overallVerdict && (
+          {/* Chat-style conversation: initial AI summary + follow-up Q&A */}
+          <div style={{
+            border: '1px solid var(--gray-200)', borderRadius: 'var(--radius)',
+            background: 'var(--gray-50)', marginBottom: '1rem', overflow: 'hidden'
+          }}>
             <div style={{
-              padding: '1rem', borderRadius: 'var(--radius)',
-              background: report.verdict === 'PASS' ? '#f0fdf4'
-                : report.verdict === 'FAIL' ? '#fef2f2'
-                : '#fffbeb',
-              border: `1px solid ${
-                report.verdict === 'PASS' ? '#86efac'
-                  : report.verdict === 'FAIL' ? '#fecaca'
-                  : '#fde68a'
-              }`,
-              marginBottom: '1.5rem'
+              maxHeight: '32rem', overflowY: 'auto', padding: '1rem',
+              display: 'flex', flexDirection: 'column', gap: '0.75rem'
             }}>
-              <p style={{ fontWeight: 500, fontSize: '0.9375rem', lineHeight: 1.6 }}>{report.overallVerdict}</p>
+              {/* Initial AI summary bubble */}
+              <div style={{
+                background: 'white', border: '1px solid var(--gray-200)',
+                borderRadius: 'var(--radius)', padding: '0.875rem 1rem',
+                fontSize: '0.875rem', lineHeight: 1.6
+              }}>
+                <div className="chat-markdown">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {report.conversationalSummary || report.overallVerdict || 'Analysis complete.'}
+                  </ReactMarkdown>
+                </div>
+              </div>
+
+              {/* Follow-up Q&A turns */}
+              {chatHistory.map((turn, i) => (
+                <div key={i} style={{ alignSelf: turn.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '85%' }}>
+                  {turn.role === 'user' ? (
+                    <div style={{
+                      background: 'var(--primary)', color: 'white',
+                      borderRadius: 'var(--radius)', padding: '0.625rem 0.875rem',
+                      fontSize: '0.875rem', lineHeight: 1.5
+                    }}>
+                      {turn.content}
+                    </div>
+                  ) : (
+                    <div style={{
+                      background: 'white', border: '1px solid var(--gray-200)',
+                      borderRadius: 'var(--radius)', padding: '0.875rem 1rem',
+                      fontSize: '0.875rem', lineHeight: 1.6
+                    }}>
+                      <div className="chat-markdown">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {/* Thinking indicator while waiting for an answer */}
+              {asking && (
+                <div style={{ alignSelf: 'flex-start' }}>
+                  <div style={{
+                    background: 'white', border: '1px solid var(--gray-200)',
+                    borderRadius: 'var(--radius)', padding: '0.625rem 0.875rem',
+                    fontSize: '0.8125rem', color: 'var(--gray-500)',
+                    display: 'flex', alignItems: 'center', gap: '0.5rem'
+                  }}>
+                    <span className="spinner" style={{ width: '0.875rem', height: '0.875rem' }} />
+                    Thinking...
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
             </div>
-          )}
+
+            {/* Ask a follow-up question */}
+            <div style={{
+              display: 'flex', gap: '0.5rem', padding: '0.75rem',
+              borderTop: '1px solid var(--gray-200)', background: 'white'
+            }}>
+              <input
+                className="form-input"
+                placeholder='Ask a question about this document — e.g. "What is a link document?"'
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleAskQuestion(); } }}
+                disabled={asking}
+                style={{ flex: 1 }}
+              />
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleAskQuestion}
+                disabled={asking || !chatInput.trim()}
+              >
+                {asking ? <span className="spinner" /> : 'Ask'}
+              </button>
+            </div>
+          </div>
+          {chatError && <div className="alert alert-error">{chatError}</div>}
+
+          <details style={{ marginBottom: '1.5rem' }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.75rem' }}>
+              View full structured report
+            </summary>
 
           {/* Thinking Steps */}
           {thinkingSteps.length > 0 && (
@@ -559,6 +686,7 @@ export default function UserPage() {
               </ul>
             </div>
           )}
+          </details>
 
           <button className="btn btn-primary" onClick={handleReset}>
             Verify Another Set of Documents

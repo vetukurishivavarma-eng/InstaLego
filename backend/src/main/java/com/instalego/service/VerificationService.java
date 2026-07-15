@@ -82,6 +82,9 @@ public class VerificationService {
             job.setStatus(VerificationJob.Status.VERIFYING);
             job.setCurrentPhase("Analyzing documents with AI...");
             job.setThinkingSteps(toJson(thinkingSteps));
+            // Keep the combined extracted text around so follow-up chat questions can be
+            // answered later without re-extracting or re-uploading the documents.
+            job.setExtractedText(allDocsText.toString());
             jobRepository.save(job);
 
             // Build optimized single prompt with ALL documents
@@ -123,6 +126,77 @@ public class VerificationService {
         }
     }
 
+    /**
+     * Answer a follow-up, chat-style question about the documents already analyzed in this
+     * session — e.g. "What is link document?" — grounding the answer in the actual uploaded
+     * text and any prior Q&A, and formatting the reply the same conversational, Markdown way
+     * as the initial report's conversationalSummary.
+     */
+    @SuppressWarnings("unchecked")
+    public String askQuestion(Long jobId, String question) {
+        VerificationJob job = jobRepository.findById(jobId)
+                .orElseThrow(() -> new IllegalArgumentException("Job not found: " + jobId));
+
+        if (job.getStatus() != VerificationJob.Status.DONE) {
+            throw new IllegalStateException("Verification must complete before you can ask questions about it");
+        }
+        if (job.getExtractedText() == null || job.getExtractedText().isBlank()) {
+            throw new IllegalStateException("No extracted document text available for this session");
+        }
+
+        List<Map<String, String>> chatHistory = parseChatHistory(job.getChatHistoryJson());
+
+        StringBuilder historyText = new StringBuilder();
+        for (Map<String, String> turn : chatHistory) {
+            String role = "user".equals(turn.get("role")) ? "User" : "Assistant";
+            historyText.append(role).append(": ").append(turn.get("content")).append("\n\n");
+        }
+
+        String systemMessage = "You are a knowledgeable legal document analysis assistant embedded in a chat " +
+                "interface. You already analyzed the document(s) below for the user. Answer their follow-up " +
+                "question the way an expert paralegal would explain it in a chat: clear, well-organized Markdown " +
+                "with bold section labels and \"* \" bullet points where helpful. Ground every specific fact " +
+                "strictly in the provided document text — never invent names, numbers, or dates. If the " +
+                "question asks about a general legal term or concept (e.g. \"link document\", \"encumbrance " +
+                "certificate\"), briefly explain the concept AND then relate it back to what actually appears " +
+                "in these specific documents. Keep the tone conversational and direct — no boilerplate " +
+                "disclaimers. Do not return JSON; return plain Markdown text only.";
+
+        String userPrompt = String.format("""
+                DOCUMENT TEXT:
+                %s
+
+                PRIOR CONVERSATION:
+                %s
+
+                NEW QUESTION:
+                %s
+                """, job.getExtractedText(), historyText.length() > 0 ? historyText.toString() : "(none yet)", question);
+
+        String answer = groqClient.sendChatPrompt(systemMessage, userPrompt);
+
+        chatHistory.add(Map.of("role", "user", "content", question));
+        chatHistory.add(Map.of("role", "assistant", "content", answer));
+        job.setChatHistoryJson(toJson(chatHistory));
+        jobRepository.save(job);
+
+        return answer;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, String>> parseChatHistory(String chatHistoryJson) {
+        try {
+            if (chatHistoryJson == null || chatHistoryJson.isBlank()) {
+                return new ArrayList<>();
+            }
+            List<Map<String, String>> history = objectMapper.readValue(chatHistoryJson, List.class);
+            return new ArrayList<>(history);
+        } catch (Exception e) {
+            log.warn("Failed to parse chat history, starting fresh: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
     private Map<String, Object> callGroqForVerification(String allDocsText, int docCount, String reportStructure)
             throws JsonProcessingException {
 
@@ -158,6 +232,22 @@ public class VerificationService {
                 5. Generate a verification report following the specified format.
                 6. Check for legal validity indicators: proper signatures, notary stamps, witness attestations,
                    registration details, stamp duty, etc.
+                7. Also write a "conversationalSummary" — a friendly, chat-style write-up of the document(s), as if
+                   a knowledgeable assistant were explaining them to the person who uploaded them. Format it in
+                   Markdown, in this style:
+                   - Open with one sentence like "I've reviewed the <document type>. Here's a summary of what it
+                     contains:"
+                   - Then use short bold section headers followed by concise bullet points, e.g. "**Document
+                     Overview**", "**Parties**", "**Property/Subject Details**", "**Consideration / Amounts**",
+                     "**Chain of Title / History**" (only if the document references prior/link documents),
+                     "**Registration / Charges**" — adapt the section names to whatever the document actually is
+                     (sale deed, lease, mortgage, will, agreement, etc.); omit sections that don't apply.
+                   - Use "* " bullet points for lists, and bold the field label before each value, e.g.
+                     "* **Vendor (Seller)**: Smt. X, residing at Y".
+                   - Keep it factual and grounded only in what is present in the documents — never invent details.
+                   - Close with one short, natural sentence inviting further questions, e.g. "What would you like
+                     help with regarding this document — a specific clause, the chain of title, or something
+                     else?"
 
                 Return JSON in this exact format:
                 {
@@ -168,6 +258,7 @@ public class VerificationService {
                   ],
                   "report": {
                     "title": "Legal Document Verification Report",
+                    "conversationalSummary": "Markdown-formatted chat-style summary as described above",
                     "dateOfAnalysis": "current date",
                     "documentsAnalyzed": [
                       {
@@ -220,12 +311,19 @@ public class VerificationService {
                 // Wrap the whole response as the report
                 Map<String, Object> report = new HashMap<>();
                 report.put("title", "Verification Report");
+                report.put("conversationalSummary", parsed.getOrDefault("conversationalSummary", null));
                 report.put("documentsAnalyzed", parsed.getOrDefault("documentsAnalyzed", List.of()));
                 report.put("crossReferenceCheck", parsed.getOrDefault("crossReferenceCheck", List.of()));
                 report.put("overallVerdict", parsed.getOrDefault("overallVerdict", "Analysis complete"));
                 report.put("recommendations", parsed.getOrDefault("recommendations", List.of()));
                 report.put("verdict", parsed.getOrDefault("verdict", "INFO"));
                 parsed.put("report", report);
+            } else {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> report = (Map<String, Object>) parsed.get("report");
+                if (report.get("conversationalSummary") == null) {
+                    report.put("conversationalSummary", buildFallbackSummary(report));
+                }
             }
 
             return parsed;
@@ -236,10 +334,44 @@ public class VerificationService {
             Map<String, Object> report = new HashMap<>();
             report.put("title", "Verification Report");
             report.put("overallVerdict", "Analysis failed: " + e.getMessage());
+            report.put("conversationalSummary", "I ran into a problem analyzing this document: " + e.getMessage() +
+                    "\n\nYou can try running verification again, or ask me a specific question about the document.");
             report.put("verdict", "ERROR");
             fallback.put("report", report);
             return fallback;
         }
+    }
+
+    /**
+     * Builds a basic Markdown summary from the structured report fields, used only when the
+     * model's JSON response is otherwise valid but happened to omit "conversationalSummary".
+     */
+    @SuppressWarnings("unchecked")
+    private String buildFallbackSummary(Map<String, Object> report) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("I've reviewed the uploaded document(s). Here's a summary:\n\n");
+        Object verdict = report.get("overallVerdict");
+        if (verdict != null) {
+            sb.append(verdict).append("\n\n");
+        }
+        Object docs = report.get("documentsAnalyzed");
+        if (docs instanceof List) {
+            for (Object d : (List<Object>) docs) {
+                if (d instanceof Map) {
+                    Map<String, Object> doc = (Map<String, Object>) d;
+                    sb.append("**").append(doc.getOrDefault("name", doc.getOrDefault("type", "Document"))).append("**\n");
+                    Object findings = doc.get("findings");
+                    if (findings instanceof List) {
+                        for (Object f : (List<Object>) findings) {
+                            sb.append("* ").append(f).append("\n");
+                        }
+                    }
+                    sb.append("\n");
+                }
+            }
+        }
+        sb.append("What would you like help with regarding this document — a specific clause, the chain of title, or something else?");
+        return sb.toString();
     }
 
     private String getReportStructure(Long bankId) {

@@ -225,10 +225,62 @@ public class VerificationController {
                 }
             }
 
+            // Follow-up chat history (empty until the user asks a question)
+            if (job.getChatHistoryJson() != null && !job.getChatHistoryJson().isBlank()) {
+                try {
+                    List<?> chat = objectMapper.readValue(job.getChatHistoryJson(), List.class);
+                    response.put("chatHistory", chat);
+                } catch (Exception e) {
+                    response.put("chatHistory", List.of());
+                }
+            } else {
+                response.put("chatHistory", List.of());
+            }
+
             return ResponseEntity.ok(response);
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    /**
+     * Ask a follow-up, chat-style question about a completed verification session
+     * (e.g. "What is link document?"). Answered in Markdown, grounded in the uploaded documents.
+     */
+    @PostMapping("/{sessionId}/ask")
+    public ResponseEntity<?> askQuestion(@PathVariable Long sessionId, @RequestBody Map<String, String> request) {
+        try {
+            String question = request.get("question");
+            if (question == null || question.isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "Question must not be empty"));
+            }
+
+            String answer = verificationService.askQuestion(sessionId, question);
+
+            Optional<VerificationJob> optJob = jobRepository.findById(sessionId);
+            List<?> chatHistory = List.of();
+            if (optJob.isPresent() && optJob.get().getChatHistoryJson() != null) {
+                try {
+                    chatHistory = objectMapper.readValue(optJob.get().getChatHistoryJson(), List.class);
+                } catch (Exception ignored) {
+                    // keep default empty list
+                }
+            }
+
+            return ResponseEntity.ok(Map.of(
+                    "sessionId", sessionId,
+                    "answer", answer,
+                    "chatHistory", chatHistory
+            ));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.notFound().build();
+        } catch (IllegalStateException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("Failed to answer question for session {}", sessionId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", "Failed to answer question: " + e.getMessage()));
         }
     }
 

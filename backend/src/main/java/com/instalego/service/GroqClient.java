@@ -80,20 +80,34 @@ public class GroqClient {
     /**
      * Send a custom prompt to Groq with a custom system message.
      * Used by VerificationService and other non-extraction flows.
+     * Forces JSON-object response mode — use this when the caller will parse the reply as JSON.
      *
      * @param systemMessage The system-level instruction for the model
      * @param userPrompt    The user message content
      * @return Raw response text from the model
      */
     public String sendPrompt(String systemMessage, String userPrompt) {
-        return callGroqInternal(systemMessage, userPrompt);
+        return callGroqInternal(systemMessage, userPrompt, true);
+    }
+
+    /**
+     * Send a custom prompt to Groq and get back freeform text (e.g. Markdown), rather than
+     * forcing JSON-object mode. Used for the conversational follow-up Q&A chat, where the
+     * answer is meant to be displayed directly to the user, not parsed as JSON.
+     *
+     * @param systemMessage The system-level instruction for the model
+     * @param userPrompt    The user message content
+     * @return Raw freeform text response from the model
+     */
+    public String sendChatPrompt(String systemMessage, String userPrompt) {
+        return callGroqInternal(systemMessage, userPrompt, false);
     }
 
     private String callGroq(String prompt) {
-        return callGroqInternal("You are a precise document processing engine. Always return valid JSON only.", prompt);
+        return callGroqInternal("You are a precise document processing engine. Always return valid JSON only.", prompt, true);
     }
 
-    private String callGroqInternal(String systemMessage, String userMessage) {
+    private String callGroqInternal(String systemMessage, String userMessage, boolean jsonMode) {
         String apiKey = System.getenv("GROQ_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException("GROQ_API_KEY environment variable is not set");
@@ -116,9 +130,11 @@ public class GroqClient {
             userMsg.put("role", "user");
             userMsg.put("content", userMessage);
 
-            // Response format (JSON object mode)
-            ObjectNode responseFormat = requestBody.putObject("response_format");
-            responseFormat.put("type", "json_object");
+            // Response format (JSON object mode) — only when the caller wants structured JSON back
+            if (jsonMode) {
+                ObjectNode responseFormat = requestBody.putObject("response_format");
+                responseFormat.put("type", "json_object");
+            }
 
             // Generation config
             requestBody.put("temperature", 0.1);
