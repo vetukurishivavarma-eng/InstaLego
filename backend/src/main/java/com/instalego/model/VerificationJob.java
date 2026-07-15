@@ -25,7 +25,7 @@ public class VerificationJob {
     private Long bankId;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, columnDefinition = "varchar(40)")
     private Status status = Status.PENDING;
 
     /**

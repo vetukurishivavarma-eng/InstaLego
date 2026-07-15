@@ -31,7 +31,7 @@ public class ConversionJob {
     private String sourceFileType; // PDF, IMAGE, DOCX
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, columnDefinition = "varchar(40)")
     private Status status = Status.PENDING;
 
     @Column(name = "extracted_json", columnDefinition = "TEXT")
