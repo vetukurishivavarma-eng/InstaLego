@@ -208,15 +208,6 @@ export const api = {
     return handleResponse<any>(res);
   },
 
-  async askVerification(sessionId: number, question: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/verify/${sessionId}/ask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
-    });
-    return handleResponse<any>(res);
-  },
-
   // Report Format (Admin)
   async uploadReportFormat(bankId: number, file: File): Promise<any> {
     const formData = new FormData();

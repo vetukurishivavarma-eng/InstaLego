@@ -1,14 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import { api, Bank } from '../api/client';
 
 const POLL_INTERVAL_MS = 1500;
-
-interface ChatTurn {
-  role: 'user' | 'assistant';
-  content: string;
-}
+const ACTIVE_STATUSES = ['PENDING', 'NEEDS_MORE_DOCUMENTS'];
+const RUNNING_STATUSES = ['EXTRACTING', 'VERIFYING'];
 
 export default function UserPage() {
   const [banks, setBanks] = useState<Bank[]>([]);
@@ -24,13 +19,7 @@ export default function UserPage() {
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [report, setReport] = useState<any>(null);
   const [documents, setDocuments] = useState<any[]>([]);
-
-  // Chat state (follow-up Q&A once the report is ready)
-  const [chatHistory, setChatHistory] = useState<ChatTurn[]>([]);
-  const [chatInput, setChatInput] = useState('');
-  const [asking, setAsking] = useState(false);
-  const [chatError, setChatError] = useState('');
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  const [missingDocuments, setMissingDocuments] = useState<any[]>([]);
 
   // Upload state
   const [uploadFile, setUploadFile] = useState<File | null>(null);
@@ -55,7 +44,7 @@ export default function UserPage() {
     loadBanks();
   }, [loadBanks]);
 
-  // Poll session status
+  // Poll session status while a run is in progress
   useEffect(() => {
     if (sessionId) {
       pollRef.current = setInterval(async () => {
@@ -72,11 +61,15 @@ export default function UserPage() {
             setDocuments(status.documents);
           }
 
-          if (status.status === 'DONE' && status.report) {
+          if (status.report) {
             setReport(status.report);
-            if (Array.isArray(status.chatHistory)) {
-              setChatHistory(status.chatHistory);
-            }
+          }
+
+          if (Array.isArray(status.missingDocuments)) {
+            setMissingDocuments(status.missingDocuments);
+          }
+
+          if (status.status === 'DONE' || status.status === 'NEEDS_MORE_DOCUMENTS') {
             if (pollRef.current) clearInterval(pollRef.current);
           }
 
@@ -111,6 +104,7 @@ export default function UserPage() {
       setDocuments([]);
       setThinkingSteps([]);
       setReport(null);
+      setMissingDocuments([]);
       setUploadFile(null);
       setUploadLabel('');
     } catch (e: any) {
@@ -124,8 +118,8 @@ export default function UserPage() {
     setError('');
     try {
       const label = uploadLabel.trim() || uploadFile.name;
-      const result = await api.addVerificationDocument(sessionId, uploadFile, label);
-      setSuccess(`"${label}" added to verification`);
+      await api.addVerificationDocument(sessionId, uploadFile, label);
+      setSuccess(`"${label}" added`);
       setUploadFile(null);
       setUploadLabel('');
       // Refresh document list
@@ -145,9 +139,9 @@ export default function UserPage() {
       setSuccess('');
       setThinkingSteps([]);
       setReport(null);
-      // Start with initial thinking step
+      setMissingDocuments([]);
       setThinkingSteps(['📄 Starting verification...']);
-      const result = await api.runVerification(sessionId);
+      await api.runVerification(sessionId);
       setSessionStatus('VERIFYING');
       setCurrentPhase('Processing documents...');
     } catch (e: any) {
@@ -162,74 +156,44 @@ export default function UserPage() {
     setThinkingSteps([]);
     setReport(null);
     setDocuments([]);
+    setMissingDocuments([]);
     setUploadFile(null);
     setUploadLabel('');
     setSuccess('');
     setError('');
-    setChatHistory([]);
-    setChatInput('');
-    setChatError('');
     if (pollRef.current) clearInterval(pollRef.current);
   };
-
-  const handleAskQuestion = async () => {
-    const question = chatInput.trim();
-    if (!sessionId || !question || asking) return;
-
-    setChatError('');
-    setChatInput('');
-    setAsking(true);
-    // Optimistically show the user's question right away
-    setChatHistory(prev => [...prev, { role: 'user', content: question }]);
-
-    try {
-      const result = await api.askVerification(sessionId, question);
-      if (Array.isArray(result.chatHistory)) {
-        setChatHistory(result.chatHistory);
-      } else if (result.answer) {
-        setChatHistory(prev => [...prev, { role: 'assistant', content: result.answer }]);
-      }
-    } catch (e: any) {
-      setChatError(e.message || 'Failed to get an answer. Please try again.');
-      // Roll back the optimistic user turn since it wasn't answered
-      setChatHistory(prev => prev.slice(0, -1));
-      setChatInput(question);
-    } finally {
-      setAsking(false);
-    }
-  };
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [chatHistory, asking]);
 
   const getStatusBadge = (status: string) => {
     const cls =
       status === 'DONE' ? 'badge-done'
         : status === 'FAILED' ? 'badge-failed'
-        : status === 'VERIFYING' || status === 'EXTRACTING' ? 'badge-processing'
+        : status === 'NEEDS_MORE_DOCUMENTS' ? 'badge-pending'
+        : RUNNING_STATUSES.includes(status) ? 'badge-processing'
         : 'badge-pending';
-    return <span className={`badge ${cls}`}>{status}</span>;
+    return <span className={`badge ${cls}`}>{status.replace(/_/g, ' ')}</span>;
   };
 
   const getVerdictBadge = (verdict: string) => {
     const cls = verdict === 'PASS' ? 'badge-done'
-      : verdict === 'PASS_WITH_CAVEATS' ? 'badge-pending'
       : verdict === 'FAIL' || verdict === 'ERROR' ? 'badge-failed'
       : 'badge-pending';
-    const label = verdict === 'PASS' ? '✅ Pass'
-      : verdict === 'PASS_WITH_CAVEATS' ? '⚠️ Pass with Caveats'
+    const label = verdict === 'PASS' ? '✅ Legally Valid (Pass)'
       : verdict === 'FAIL' ? '❌ Fail'
+      : verdict === 'INCOMPLETE' ? '📎 Incomplete — documents needed'
       : verdict === 'ERROR' ? '⚠️ Error'
       : verdict;
     return <span className={`badge ${cls}`}>{label}</span>;
   };
 
+  const isUploadStage = sessionId && ACTIVE_STATUSES.includes(sessionStatus);
+  const isRunning = RUNNING_STATUSES.includes(sessionStatus);
+
   return (
     <div>
       <div className="page-header">
-        <h1>Verify Legal Documents</h1>
-        <p>Upload multiple legal documents and verify them against each other with AI-powered cross-referencing</p>
+        <h1>Legal Document Verification</h1>
+        <p>Upload documents for a bank and get a legal verification report — if a referenced document is missing, you'll be asked to add it.</p>
       </div>
 
       {error && <div className="alert alert-error">{error}</div>}
@@ -267,22 +231,41 @@ export default function UserPage() {
             disabled={!selectedBankId || loading}
             style={{ width: '100%', justifyContent: 'center' }}
           >
-            Start Verification Session
+            Start Verification
           </button>
         </div>
       )}
 
-      {/* Document Upload (during session) */}
-      {sessionId && sessionStatus === 'PENDING' && (
+      {/* Upload stage: initial upload (PENDING) or supplying a missing referenced document (NEEDS_MORE_DOCUMENTS) */}
+      {isUploadStage && (
         <div className="card" style={{ marginBottom: '1.5rem' }}>
+          {sessionStatus === 'NEEDS_MORE_DOCUMENTS' && missingDocuments.length > 0 && (
+            <div style={{
+              padding: '1rem', borderRadius: 'var(--radius)',
+              background: '#fffbeb', border: '1px solid #fde68a', marginBottom: '1.5rem'
+            }}>
+              <p style={{ fontWeight: 600, fontSize: '0.9375rem', marginBottom: '0.5rem', color: '#92400e' }}>
+                📎 {missingDocuments.length} more document{missingDocuments.length > 1 ? 's are' : ' is'} needed to complete verification
+              </p>
+              {missingDocuments.map((md: any, i: number) => (
+                <div key={i} style={{ marginBottom: '0.625rem', fontSize: '0.875rem', color: '#78350f' }}>
+                  <div style={{ fontWeight: 600 }}>{md.description || `Missing document ${i + 1}`}</div>
+                  {md.reason && <div>{md.reason}</div>}
+                  {md.referencedIn && (
+                    <div style={{ fontSize: '0.8125rem', color: '#92400e' }}>Referenced in: {md.referencedIn}</div>
+                  )}
+                </div>
+              ))}
+              <p style={{ fontSize: '0.8125rem', color: '#92400e' }}>
+                Upload the document(s) above, then click "Continue Verification" below.
+              </p>
+            </div>
+          )}
+
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
             <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Upload Documents</h2>
             <span className="badge badge-processing">{documents.length} document(s)</span>
           </div>
-
-          <p style={{ fontSize: '0.875rem', color: 'var(--gray-500)', marginBottom: '1rem' }}>
-            Add documents one at a time. The AI will cross-reference all documents when you click "Run Verification".
-          </p>
 
           {/* Document List */}
           {documents.length > 0 && (
@@ -350,7 +333,7 @@ export default function UserPage() {
             </button>
           </div>
 
-          {/* Run Verification Button */}
+          {/* Run / Continue Verification Button */}
           {documents.length >= 1 && (
             <button
               className="btn btn-primary"
@@ -361,7 +344,7 @@ export default function UserPage() {
                    strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <polygon points="5 3 19 12 5 21 5 3"/>
               </svg>
-              Run Verification ({documents.length} document{documents.length > 1 ? 's' : ''})
+              {sessionStatus === 'NEEDS_MORE_DOCUMENTS' ? 'Continue Verification' : 'Run Verification'} ({documents.length} document{documents.length > 1 ? 's' : ''})
             </button>
           )}
 
@@ -372,14 +355,13 @@ export default function UserPage() {
       )}
 
       {/* Running verification */}
-      {sessionStatus && sessionStatus !== 'PENDING' && sessionStatus !== 'DONE' && sessionStatus !== 'FAILED' && (
+      {isRunning && (
         <div className="card" style={{ marginBottom: '1.5rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
             <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Verification in Progress</h2>
             {getStatusBadge(sessionStatus)}
           </div>
 
-          {/* Current Phase */}
           {currentPhase && (
             <div style={{
               padding: '0.75rem 1rem', borderRadius: 'var(--radius)',
@@ -392,7 +374,6 @@ export default function UserPage() {
             </div>
           )}
 
-          {/* Thinking Steps - Streaming */}
           {thinkingSteps.length > 0 && (
             <div>
               <label style={{ fontWeight: 600, fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.5rem', display: 'block' }}>
@@ -411,28 +392,18 @@ export default function UserPage() {
                       display: 'flex', alignItems: 'center', gap: '0.5rem'
                     }}
                   >
-                    {step.startsWith('🤖') ? (
-                      <span style={{ fontSize: '1rem' }}>🤖</span>
-                    ) : step.startsWith('⚠️') ? (
-                      <span style={{ fontSize: '1rem' }}>⚠️</span>
-                    ) : (
-                      <span style={{ fontSize: '1rem' }}>📄</span>
-                    )}
-                    <span>{step.replace(/^[🤖📄⚠️]\s*/, '')}</span>
+                    <span>{step}</span>
                   </div>
                 ))}
-                {/* Animated "thinking" indicator during verification */}
-                {(sessionStatus === 'VERIFYING' || sessionStatus === 'EXTRACTING') && (
-                  <div style={{
-                    padding: '0.5rem 0.75rem', borderRadius: 'var(--radius)',
-                    background: 'var(--gray-50)', border: '1px solid var(--gray-200)',
-                    fontSize: '0.8125rem', color: 'var(--gray-500)', fontStyle: 'italic',
-                    display: 'flex', alignItems: 'center', gap: '0.5rem'
-                  }}>
-                    <span className="spinner" style={{ width: '0.75rem', height: '0.75rem' }} />
-                    Processing...
-                  </div>
-                )}
+                <div style={{
+                  padding: '0.5rem 0.75rem', borderRadius: 'var(--radius)',
+                  background: 'var(--gray-50)', border: '1px solid var(--gray-200)',
+                  fontSize: '0.8125rem', color: 'var(--gray-500)', fontStyle: 'italic',
+                  display: 'flex', alignItems: 'center', gap: '0.5rem'
+                }}>
+                  <span className="spinner" style={{ width: '0.75rem', height: '0.75rem' }} />
+                  Processing...
+                </div>
               </div>
             </div>
           )}
@@ -443,129 +414,25 @@ export default function UserPage() {
         </div>
       )}
 
-      {/* Results */}
-      {report && (
+      {/* Final report */}
+      {sessionStatus === 'DONE' && report && (
         <div className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>{report.title || 'Verification Report'}</h2>
+            <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>{report.title || 'Legal Verification Report'}</h2>
             {report.verdict && getVerdictBadge(report.verdict)}
           </div>
 
-          {/* Chat-style conversation: initial AI summary + follow-up Q&A */}
-          <div style={{
-            border: '1px solid var(--gray-200)', borderRadius: 'var(--radius)',
-            background: 'var(--gray-50)', marginBottom: '1rem', overflow: 'hidden'
-          }}>
+          {report.overallVerdict && (
             <div style={{
-              maxHeight: '32rem', overflowY: 'auto', padding: '1rem',
-              display: 'flex', flexDirection: 'column', gap: '0.75rem'
+              padding: '1rem', borderRadius: 'var(--radius)',
+              background: report.verdict === 'PASS' ? '#f0fdf4' : report.verdict === 'FAIL' ? '#fef2f2' : '#fffbeb',
+              border: `1px solid ${report.verdict === 'PASS' ? '#86efac' : report.verdict === 'FAIL' ? '#fecaca' : '#fde68a'}`,
+              marginBottom: '1.5rem'
             }}>
-              {/* Initial AI summary bubble */}
-              <div style={{
-                background: 'white', border: '1px solid var(--gray-200)',
-                borderRadius: 'var(--radius)', padding: '0.875rem 1rem',
-                fontSize: '0.875rem', lineHeight: 1.6
-              }}>
-                <div className="chat-markdown">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {report.conversationalSummary || report.overallVerdict || 'Analysis complete.'}
-                  </ReactMarkdown>
-                </div>
-              </div>
-
-              {/* Follow-up Q&A turns */}
-              {chatHistory.map((turn, i) => (
-                <div key={i} style={{ alignSelf: turn.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '85%' }}>
-                  {turn.role === 'user' ? (
-                    <div style={{
-                      background: 'var(--primary)', color: 'white',
-                      borderRadius: 'var(--radius)', padding: '0.625rem 0.875rem',
-                      fontSize: '0.875rem', lineHeight: 1.5
-                    }}>
-                      {turn.content}
-                    </div>
-                  ) : (
-                    <div style={{
-                      background: 'white', border: '1px solid var(--gray-200)',
-                      borderRadius: 'var(--radius)', padding: '0.875rem 1rem',
-                      fontSize: '0.875rem', lineHeight: 1.6
-                    }}>
-                      <div className="chat-markdown">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-
-              {/* Thinking indicator while waiting for an answer */}
-              {asking && (
-                <div style={{ alignSelf: 'flex-start' }}>
-                  <div style={{
-                    background: 'white', border: '1px solid var(--gray-200)',
-                    borderRadius: 'var(--radius)', padding: '0.625rem 0.875rem',
-                    fontSize: '0.8125rem', color: 'var(--gray-500)',
-                    display: 'flex', alignItems: 'center', gap: '0.5rem'
-                  }}>
-                    <span className="spinner" style={{ width: '0.875rem', height: '0.875rem' }} />
-                    Thinking...
-                  </div>
-                </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-
-            {/* Ask a follow-up question */}
-            <div style={{
-              display: 'flex', gap: '0.5rem', padding: '0.75rem',
-              borderTop: '1px solid var(--gray-200)', background: 'white'
-            }}>
-              <input
-                className="form-input"
-                placeholder='Ask a question about this document — e.g. "What is a link document?"'
-                value={chatInput}
-                onChange={e => setChatInput(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleAskQuestion(); } }}
-                disabled={asking}
-                style={{ flex: 1 }}
-              />
-              <button
-                className="btn btn-primary btn-sm"
-                onClick={handleAskQuestion}
-                disabled={asking || !chatInput.trim()}
-              >
-                {asking ? <span className="spinner" /> : 'Ask'}
-              </button>
-            </div>
-          </div>
-          {chatError && <div className="alert alert-error">{chatError}</div>}
-
-          <details style={{ marginBottom: '1.5rem' }}>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.75rem' }}>
-              View full structured report
-            </summary>
-
-          {/* Thinking Steps */}
-          {thinkingSteps.length > 0 && (
-            <div style={{ marginBottom: '1.5rem' }}>
-              <label style={{ fontWeight: 600, fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.5rem', display: 'block' }}>
-                AI Reasoning Process
-              </label>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                {thinkingSteps.map((step, i) => (
-                  <div key={i} style={{
-                    padding: '0.375rem 0.75rem', fontSize: '0.8125rem',
-                    color: 'var(--gray-600)', borderLeft: '2px solid var(--gray-300)',
-                    marginLeft: '0.5rem'
-                  }}>
-                    {step}
-                  </div>
-                ))}
-              </div>
+              <p style={{ fontWeight: 500, fontSize: '0.9375rem', lineHeight: 1.6 }}>{report.overallVerdict}</p>
             </div>
           )}
 
-          {/* Document Analysis */}
           {report.documentsAnalyzed && report.documentsAnalyzed.length > 0 && (
             <div style={{ marginBottom: '1.5rem' }}>
               <label style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.75rem', display: 'block' }}>
@@ -630,7 +497,6 @@ export default function UserPage() {
             </div>
           )}
 
-          {/* Cross-Reference Check */}
           {report.crossReferenceCheck && report.crossReferenceCheck.length > 0 && (
             <div style={{ marginBottom: '1.5rem' }}>
               <label style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.75rem', display: 'block' }}>
@@ -671,7 +537,6 @@ export default function UserPage() {
             </div>
           )}
 
-          {/* Recommendations */}
           {report.recommendations && report.recommendations.length > 0 && (
             <div style={{ marginBottom: '1.5rem' }}>
               <label style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.5rem', display: 'block' }}>
@@ -686,10 +551,9 @@ export default function UserPage() {
               </ul>
             </div>
           )}
-          </details>
 
           <button className="btn btn-primary" onClick={handleReset}>
-            Verify Another Set of Documents
+            Verify Another Document
           </button>
         </div>
       )}

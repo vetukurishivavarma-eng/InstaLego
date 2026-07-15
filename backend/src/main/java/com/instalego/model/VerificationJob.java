@@ -14,7 +14,7 @@ import java.time.LocalDateTime;
 public class VerificationJob {
 
     public enum Status {
-        PENDING, EXTRACTING, VERIFYING, DONE, FAILED
+        PENDING, EXTRACTING, VERIFYING, NEEDS_MORE_DOCUMENTS, DONE, FAILED
     }
 
     @Id
@@ -58,19 +58,13 @@ public class VerificationJob {
     private String errorMessage;
 
     /**
-     * Combined plain text extracted from all uploaded documents. Kept around (rather than
-     * discarded after the initial analysis) so follow-up chat questions can be answered
-     * without re-uploading or re-extracting the documents.
+     * JSON array of documents that are referenced inside the uploaded documents (e.g. a prior
+     * sale deed, a link document, an NOC) but were not themselves uploaded. Verification cannot
+     * conclude PASS/FAIL until these are provided:
+     * [{"description":"...", "reason":"...", "referencedIn":"..."}, ...]
      */
-    @Column(name = "extracted_text", columnDefinition = "TEXT")
-    private String extractedText;
-
-    /**
-     * JSON array of the follow-up Q&A chat exchanged after the initial report:
-     * [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}, ...]
-     */
-    @Column(name = "chat_history_json", columnDefinition = "TEXT")
-    private String chatHistoryJson = "[]";
+    @Column(name = "missing_documents_json", columnDefinition = "TEXT")
+    private String missingDocumentsJson;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;

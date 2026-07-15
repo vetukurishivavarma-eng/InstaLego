@@ -30,8 +30,30 @@ public class VerificationService {
     private static final Tika TIKA = new Tika();
 
     /**
-     * Run verification on all documents in a job.
-     * Uses a SINGLE Groq API call with all document texts in one optimized prompt.
+     * Default legal verification report structure used when a bank hasn't uploaded its own
+     * report template. Covers what any bank/lender would typically need to sign off on a
+     * property's legal standing.
+     */
+    private static final String DEFAULT_REPORT_STRUCTURE = """
+            1. Document Overview — type, date of execution, registration number/date, registering office.
+            2. Parties Involved — full names and roles (e.g. Vendor/Seller, Vendee/Buyer, executant).
+            3. Property / Subject Matter Details — description, extent, survey/plot numbers, boundaries.
+            4. Chain of Title — the sequence of prior documents that establish how the current holder
+               acquired the property (link documents / prior deeds).
+            5. Document-by-Document Legal Validity — signatures, witness attestations, notarization,
+               registration compliance, stamp duty payment.
+            6. Cross-Reference & Consistency Check — do names, dates, amounts, and reference numbers
+               match consistently across all provided documents?
+            7. Missing Documents — any document referenced but not provided, with why it's needed.
+            8. Legal Verdict — PASS (legally valid, chain complete), FAIL (defects found), or
+               INCOMPLETE (cannot conclude until missing documents are provided).
+            9. Recommendations — concrete next steps.
+            """;
+
+    /**
+     * Run verification on all documents currently attached to a job. Called both for the first
+     * run and for every re-run after the user uploads additional (previously missing) documents —
+     * each run re-extracts and re-analyzes the FULL current document set from scratch.
      * Transactional boundary is managed by the caller (VerificationController.runAsyncVerification).
      */
     public VerificationJob runVerification(Long jobId) {
@@ -44,7 +66,7 @@ public class VerificationService {
             job.setCurrentPhase("Extracting text from documents...");
             jobRepository.save(job);
 
-            // Parse documents JSON
+            // Parse documents JSON (the full current set — original + any added since)
             List<Map<String, Object>> documents = parseDocumentsJson(job.getDocumentsJson());
 
             // Extract text from each document (sequential to minimize peak memory)
@@ -87,16 +109,13 @@ public class VerificationService {
                 throw new IllegalStateException("Could not extract text from any uploaded document");
             }
 
-            // Get report format structure from bank (if admin uploaded one)
+            // Get report format structure from bank (if admin uploaded one), else use the default
             String reportStructure = getReportStructure(job.getBankId());
 
             // Phase: VERIFYING
             job.setStatus(VerificationJob.Status.VERIFYING);
-            job.setCurrentPhase("Analyzing documents with AI...");
+            job.setCurrentPhase("Verifying legality and checking for missing referenced documents...");
             job.setThinkingSteps(toJson(thinkingSteps));
-            // Keep the combined extracted text around so follow-up chat questions can be
-            // answered later without re-extracting or re-uploading the documents.
-            job.setExtractedText(allDocsText.toString());
             jobRepository.save(job);
 
             // Build optimized single prompt with ALL documents
@@ -106,25 +125,30 @@ public class VerificationService {
             // Extract thinking steps from the AI response
             @SuppressWarnings("unchecked")
             List<String> aiThinkingSteps = (List<String>) verificationResult.getOrDefault("reasoningSteps", List.of());
-
-            // Merge AI thinking steps into our existing steps
-            int orderOffset = thinkingSteps.size();
-            for (int i = 0; i < aiThinkingSteps.size(); i++) {
-                thinkingSteps.add("🤖 " + aiThinkingSteps.get(i));
+            for (String step : aiThinkingSteps) {
+                thinkingSteps.add("🤖 " + step);
             }
 
-            // Extract the report
-            Object report = verificationResult.get("report");
+            // Extract the report and figure out whether any referenced documents are missing
+            Object reportObj = verificationResult.get("report");
+            List<Object> missingDocuments = extractMissingDocuments(reportObj);
+            String verdict = extractVerdict(reportObj);
 
-            // Save final result
             job.setThinkingSteps(toJson(thinkingSteps));
-            job.setReportJson(toJson(report));
-            job.setCurrentPhase("✅ Verification complete");
-            job.setStatus(VerificationJob.Status.DONE);
+            job.setReportJson(toJson(reportObj));
+            job.setMissingDocumentsJson(toJson(missingDocuments));
+
+            if (!missingDocuments.isEmpty()) {
+                job.setStatus(VerificationJob.Status.NEEDS_MORE_DOCUMENTS);
+                job.setCurrentPhase("📎 " + missingDocuments.size() + " referenced document(s) still needed to complete verification");
+            } else {
+                job.setStatus(VerificationJob.Status.DONE);
+                job.setCurrentPhase("✅ Verification complete — verdict: " + verdict);
+            }
             jobRepository.save(job);
 
-            log.info("Verification job {} complete: {} documents, {} thinking steps",
-                    jobId, documents.size(), thinkingSteps.size());
+            log.info("Verification job {} finished: {} documents, verdict={}, missing={}",
+                    jobId, documents.size(), verdict, missingDocuments.size());
 
             return job;
 
@@ -138,128 +162,74 @@ public class VerificationService {
         }
     }
 
-    /**
-     * Answer a follow-up, chat-style question about the documents already analyzed in this
-     * session — e.g. "What is link document?" — grounding the answer in the actual uploaded
-     * text and any prior Q&A, and formatting the reply the same conversational, Markdown way
-     * as the initial report's conversationalSummary.
-     */
     @SuppressWarnings("unchecked")
-    public String askQuestion(Long jobId, String question) {
-        VerificationJob job = jobRepository.findById(jobId)
-                .orElseThrow(() -> new IllegalArgumentException("Job not found: " + jobId));
-
-        if (job.getStatus() != VerificationJob.Status.DONE) {
-            throw new IllegalStateException("Verification must complete before you can ask questions about it");
+    private List<Object> extractMissingDocuments(Object reportObj) {
+        if (reportObj instanceof Map) {
+            Object md = ((Map<String, Object>) reportObj).get("missingDocuments");
+            if (md instanceof List) {
+                return (List<Object>) md;
+            }
         }
-        if (job.getExtractedText() == null || job.getExtractedText().isBlank()) {
-            throw new IllegalStateException("No extracted document text available for this session");
-        }
-
-        List<Map<String, String>> chatHistory = parseChatHistory(job.getChatHistoryJson());
-
-        StringBuilder historyText = new StringBuilder();
-        for (Map<String, String> turn : chatHistory) {
-            String role = "user".equals(turn.get("role")) ? "User" : "Assistant";
-            historyText.append(role).append(": ").append(turn.get("content")).append("\n\n");
-        }
-
-        String systemMessage = "You are a knowledgeable legal document analysis assistant embedded in a chat " +
-                "interface. You already analyzed the document(s) below for the user. Answer their follow-up " +
-                "question the way an expert paralegal would explain it in a chat: clear, well-organized Markdown " +
-                "with bold section labels and \"* \" bullet points where helpful. Ground every specific fact " +
-                "strictly in the provided document text — never invent names, numbers, or dates. If the " +
-                "question asks about a general legal term or concept (e.g. \"link document\", \"encumbrance " +
-                "certificate\"), briefly explain the concept AND then relate it back to what actually appears " +
-                "in these specific documents. Keep the tone conversational and direct — no boilerplate " +
-                "disclaimers. Do not return JSON; return plain Markdown text only.";
-
-        String userPrompt = String.format("""
-                DOCUMENT TEXT:
-                %s
-
-                PRIOR CONVERSATION:
-                %s
-
-                NEW QUESTION:
-                %s
-                """, job.getExtractedText(), historyText.length() > 0 ? historyText.toString() : "(none yet)", question);
-
-        String answer = groqClient.sendChatPrompt(systemMessage, userPrompt);
-
-        chatHistory.add(Map.of("role", "user", "content", question));
-        chatHistory.add(Map.of("role", "assistant", "content", answer));
-        job.setChatHistoryJson(toJson(chatHistory));
-        jobRepository.save(job);
-
-        return answer;
+        return List.of();
     }
 
     @SuppressWarnings("unchecked")
-    private List<Map<String, String>> parseChatHistory(String chatHistoryJson) {
-        try {
-            if (chatHistoryJson == null || chatHistoryJson.isBlank()) {
-                return new ArrayList<>();
+    private String extractVerdict(Object reportObj) {
+        if (reportObj instanceof Map) {
+            Object v = ((Map<String, Object>) reportObj).get("verdict");
+            if (v != null) {
+                return v.toString();
             }
-            List<Map<String, String>> history = objectMapper.readValue(chatHistoryJson, List.class);
-            return new ArrayList<>(history);
-        } catch (Exception e) {
-            log.warn("Failed to parse chat history, starting fresh: {}", e.getMessage());
-            return new ArrayList<>();
         }
+        return "INFO";
     }
 
     private Map<String, Object> callGroqForVerification(String allDocsText, int docCount, String reportStructure)
             throws JsonProcessingException {
 
-        String structureInstructions;
-        if (reportStructure != null && !reportStructure.isBlank()) {
-            structureInstructions = "Follow this report structure exactly:\n" + reportStructure;
-        } else {
-            structureInstructions = "Use a standard legal verification report format with: " +
-                    "Executive Summary, Document-by-Document Analysis, Cross-Reference Check, and Overall Verdict.";
-        }
+        String structureInstructions = (reportStructure != null && !reportStructure.isBlank())
+                ? "Follow this bank's report structure exactly:\n" + reportStructure
+                : "No bank-specific template was provided — use this default legal verification report structure:\n"
+                + DEFAULT_REPORT_STRUCTURE;
 
-        String systemMessage = "You are a legal document verification expert. " +
-                "Analyze the documents, cross-reference them, and generate a verification report. " +
-                "Return ONLY valid JSON. No markdown fences, no preamble.";
+        String systemMessage = "You are a legal document verification expert working on behalf of a bank/lender. " +
+                "Your job is to determine whether the submitted document(s) are legally valid and whether the " +
+                "chain of title / supporting documentation is complete. Return ONLY valid JSON. No markdown " +
+                "fences, no preamble.";
 
         String userPrompt = String.format("""
-                You have been given %d legal documents to analyze and cross-reference.
+                You have been given %d document(s) to verify for legal validity and completeness.
 
                 %s
 
-                DOCUMENTS:
+                DOCUMENTS PROVIDED:
                 %s
 
                 TASK:
-                1. For EACH document, extract and list: date, parties involved, reference numbers/IDs, amounts,
-                   property details, and key clauses.
-                2. CROSS-REFERENCE between all documents:
-                   - Do reference numbers in one document appear and match in others?
-                   - Are names, dates, amounts consistent across documents?
-                   - Are there any references to documents that are NOT in the provided set?
-                3. For each cross-reference, note whether it MATCHES or has a DISCREPANCY.
-                4. Identify any gaps, missing information, or inconsistencies.
-                5. Generate a verification report following the specified format.
-                6. Check for legal validity indicators: proper signatures, notary stamps, witness attestations,
-                   registration details, stamp duty, etc.
-                7. Also write a "conversationalSummary" — a friendly, chat-style write-up of the document(s), as if
-                   a knowledgeable assistant were explaining them to the person who uploaded them. Format it in
-                   Markdown, in this style:
-                   - Open with one sentence like "I've reviewed the <document type>. Here's a summary of what it
-                     contains:"
-                   - Then use short bold section headers followed by concise bullet points, e.g. "**Document
-                     Overview**", "**Parties**", "**Property/Subject Details**", "**Consideration / Amounts**",
-                     "**Chain of Title / History**" (only if the document references prior/link documents),
-                     "**Registration / Charges**" — adapt the section names to whatever the document actually is
-                     (sale deed, lease, mortgage, will, agreement, etc.); omit sections that don't apply.
-                   - Use "* " bullet points for lists, and bold the field label before each value, e.g.
-                     "* **Vendor (Seller)**: Smt. X, residing at Y".
-                   - Keep it factual and grounded only in what is present in the documents — never invent details.
-                   - Close with one short, natural sentence inviting further questions, e.g. "What would you like
-                     help with regarding this document — a specific clause, the chain of title, or something
-                     else?"
+                1. For EACH document provided, extract and record: document type, date, parties, reference or
+                   registration numbers, amounts, property/subject details, and key clauses.
+                2. Check legal validity indicators for each: proper execution, signatures, witness attestations,
+                   notarization, registration compliance, stamp duty payment, etc. Note any issues found.
+                3. Identify every OTHER document referenced INSIDE the provided documents that would be needed
+                   to establish a complete, verifiable chain — e.g. a prior sale deed, gift deed, partition deed,
+                   release deed, power of attorney, encumbrance certificate, NOC, mortgage release, court order,
+                   or any document cited as the source of title, as a schedule reference, or as a supporting
+                   annexure.
+                4. For each such referenced document, check whether it IS already included among the documents
+                   provided (matching by document number, date, or description). If a referenced document is
+                   NOT included, add it to "missingDocuments" with a clear, plain-language description of what
+                   to upload and why it's needed to complete verification.
+                5. Cross-reference the documents that ARE provided against each other: do names, dates, amounts,
+                   and reference numbers match consistently? Flag any MISMATCH.
+                6. Decide the verdict:
+                   - "INCOMPLETE" if missingDocuments is non-empty — verification cannot conclude legality until
+                     they are provided.
+                   - "FAIL" if all referenced documents are present but there are legal defects, missing
+                     signatures/registration, or unresolved mismatches.
+                   - "PASS" if all referenced documents are present, cross-references are consistent, and no
+                     legal defects were found.
+                7. Write a clear "overallVerdict" explaining the reasoning in plain language, and concrete
+                   "recommendations" for next steps.
 
                 Return JSON in this exact format:
                 {
@@ -269,9 +239,7 @@ public class VerificationService {
                     ...
                   ],
                   "report": {
-                    "title": "Legal Document Verification Report",
-                    "conversationalSummary": "Markdown-formatted chat-style summary as described above",
-                    "dateOfAnalysis": "current date",
+                    "title": "Legal Verification Report",
                     "documentsAnalyzed": [
                       {
                         "name": "Document name",
@@ -288,6 +256,13 @@ public class VerificationService {
                         "status": "VALID / MINOR_ISSUES / INVALID"
                       }
                     ],
+                    "missingDocuments": [
+                      {
+                        "description": "e.g. Sale Deed dated 07-09-2016, Doc No. 5185/2016",
+                        "reason": "Why this document is needed to complete the chain of title",
+                        "referencedIn": "Name of the document that references it"
+                      }
+                    ],
                     "crossReferenceCheck": [
                       {
                         "documents": ["Doc A", "Doc B"],
@@ -300,7 +275,7 @@ public class VerificationService {
                     ],
                     "overallVerdict": "Detailed overall assessment...",
                     "recommendations": ["Recommendation 1...", "Recommendation 2..."],
-                    "verdict": "PASS / PASS_WITH_CAVEATS / FAIL"
+                    "verdict": "PASS / FAIL / INCOMPLETE"
                   }
                 }
                 """, docCount, structureInstructions, allDocsText);
@@ -315,27 +290,24 @@ public class VerificationService {
             // The response might include the reasoningSteps and report at top level
             Map<String, Object> parsed = objectMapper.readValue(response, Map.class);
 
-            // Ensure the expected structure exists
             if (!parsed.containsKey("reasoningSteps")) {
                 parsed.put("reasoningSteps", List.of("Analysis complete"));
             }
             if (!parsed.containsKey("report")) {
                 // Wrap the whole response as the report
                 Map<String, Object> report = new HashMap<>();
-                report.put("title", "Verification Report");
-                report.put("conversationalSummary", parsed.getOrDefault("conversationalSummary", null));
+                report.put("title", "Legal Verification Report");
                 report.put("documentsAnalyzed", parsed.getOrDefault("documentsAnalyzed", List.of()));
+                report.put("missingDocuments", parsed.getOrDefault("missingDocuments", List.of()));
                 report.put("crossReferenceCheck", parsed.getOrDefault("crossReferenceCheck", List.of()));
                 report.put("overallVerdict", parsed.getOrDefault("overallVerdict", "Analysis complete"));
                 report.put("recommendations", parsed.getOrDefault("recommendations", List.of()));
-                report.put("verdict", parsed.getOrDefault("verdict", "INFO"));
+                report.put("verdict", parsed.getOrDefault("verdict", "INCOMPLETE"));
                 parsed.put("report", report);
             } else {
-                @SuppressWarnings("unchecked")
                 Map<String, Object> report = (Map<String, Object>) parsed.get("report");
-                if (report.get("conversationalSummary") == null) {
-                    report.put("conversationalSummary", buildFallbackSummary(report));
-                }
+                report.putIfAbsent("missingDocuments", List.of());
+                report.putIfAbsent("verdict", "INCOMPLETE");
             }
 
             return parsed;
@@ -344,46 +316,13 @@ public class VerificationService {
             Map<String, Object> fallback = new HashMap<>();
             fallback.put("reasoningSteps", List.of("Analysis could not be parsed"));
             Map<String, Object> report = new HashMap<>();
-            report.put("title", "Verification Report");
+            report.put("title", "Legal Verification Report");
             report.put("overallVerdict", "Analysis failed: " + e.getMessage());
-            report.put("conversationalSummary", "I ran into a problem analyzing this document: " + e.getMessage() +
-                    "\n\nYou can try running verification again, or ask me a specific question about the document.");
+            report.put("missingDocuments", List.of());
             report.put("verdict", "ERROR");
             fallback.put("report", report);
             return fallback;
         }
-    }
-
-    /**
-     * Builds a basic Markdown summary from the structured report fields, used only when the
-     * model's JSON response is otherwise valid but happened to omit "conversationalSummary".
-     */
-    @SuppressWarnings("unchecked")
-    private String buildFallbackSummary(Map<String, Object> report) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("I've reviewed the uploaded document(s). Here's a summary:\n\n");
-        Object verdict = report.get("overallVerdict");
-        if (verdict != null) {
-            sb.append(verdict).append("\n\n");
-        }
-        Object docs = report.get("documentsAnalyzed");
-        if (docs instanceof List) {
-            for (Object d : (List<Object>) docs) {
-                if (d instanceof Map) {
-                    Map<String, Object> doc = (Map<String, Object>) d;
-                    sb.append("**").append(doc.getOrDefault("name", doc.getOrDefault("type", "Document"))).append("**\n");
-                    Object findings = doc.get("findings");
-                    if (findings instanceof List) {
-                        for (Object f : (List<Object>) findings) {
-                            sb.append("* ").append(f).append("\n");
-                        }
-                    }
-                    sb.append("\n");
-                }
-            }
-        }
-        sb.append("What would you like help with regarding this document — a specific clause, the chain of title, or something else?");
-        return sb.toString();
     }
 
     private String getReportStructure(Long bankId) {
@@ -472,6 +411,5 @@ public class VerificationService {
             return "[]";
         }
     }
-
 
 }

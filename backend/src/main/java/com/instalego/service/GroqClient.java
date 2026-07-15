@@ -90,19 +90,6 @@ public class GroqClient {
         return callGroqInternal(systemMessage, userPrompt, true);
     }
 
-    /**
-     * Send a custom prompt to Groq and get back freeform text (e.g. Markdown), rather than
-     * forcing JSON-object mode. Used for the conversational follow-up Q&A chat, where the
-     * answer is meant to be displayed directly to the user, not parsed as JSON.
-     *
-     * @param systemMessage The system-level instruction for the model
-     * @param userPrompt    The user message content
-     * @return Raw freeform text response from the model
-     */
-    public String sendChatPrompt(String systemMessage, String userPrompt) {
-        return callGroqInternal(systemMessage, userPrompt, false);
-    }
-
     private String callGroq(String prompt) {
         return callGroqInternal("You are a precise document processing engine. Always return valid JSON only.", prompt, true);
     }

@@ -26,6 +26,9 @@ import java.util.*;
 @Slf4j
 public class VerificationController {
 
+    private static final Set<VerificationJob.Status> UPLOADABLE_STATUSES = Set.of(
+            VerificationJob.Status.PENDING, VerificationJob.Status.NEEDS_MORE_DOCUMENTS);
+
     private final VerificationJobRepository jobRepository;
     private final VerificationService verificationService;
     private final ObjectMapper objectMapper;
@@ -66,7 +69,9 @@ public class VerificationController {
     }
 
     /**
-     * Step 2: Add a document to a session (call multiple times for each document).
+     * Step 2: Add a document to a session. Works both for the initial upload batch (status
+     * PENDING) and for supplying a previously-missing referenced document after a run flagged
+     * it (status NEEDS_MORE_DOCUMENTS).
      */
     @PostMapping("/{sessionId}/add-document")
     public ResponseEntity<?> addDocument(
@@ -80,7 +85,7 @@ public class VerificationController {
             }
 
             VerificationJob job = optJob.get();
-            if (job.getStatus() != VerificationJob.Status.PENDING) {
+            if (!UPLOADABLE_STATUSES.contains(job.getStatus())) {
                 return ResponseEntity.badRequest().body(Map.of("error",
                         "Cannot add documents to a session that is already " + job.getStatus().name()));
             }
@@ -131,7 +136,9 @@ public class VerificationController {
     }
 
     /**
-     * Step 3: Trigger verification.
+     * Step 3: Trigger (or re-trigger) verification. Allowed from PENDING (first run) or from
+     * NEEDS_MORE_DOCUMENTS (re-run after the user supplied a previously-missing document) — each
+     * run re-analyzes the full current set of uploaded documents from scratch.
      */
     @PostMapping("/{sessionId}/run")
     public ResponseEntity<?> runVerification(@PathVariable Long sessionId) {
@@ -142,7 +149,7 @@ public class VerificationController {
             }
 
             VerificationJob job = optJob.get();
-            if (job.getStatus() != VerificationJob.Status.PENDING) {
+            if (!UPLOADABLE_STATUSES.contains(job.getStatus())) {
                 return ResponseEntity.badRequest().body(Map.of("error",
                         "Session is already " + job.getStatus().name()));
             }
@@ -171,7 +178,8 @@ public class VerificationController {
     }
 
     /**
-     * Poll: Get verification status and thinking steps.
+     * Poll: Get verification status, thinking steps, missing documents, and (when complete) the
+     * final report.
      */
     @GetMapping("/{sessionId}")
     public ResponseEntity<?> getStatus(@PathVariable Long sessionId) {
@@ -203,14 +211,29 @@ public class VerificationController {
                 response.put("thinkingSteps", List.of());
             }
 
-            // Return report only when done
-            if (job.getStatus() == VerificationJob.Status.DONE && job.getReportJson() != null) {
+            // Return the report once we have one (either final DONE, or the partial analysis
+            // that accompanies a NEEDS_MORE_DOCUMENTS result)
+            if (job.getReportJson() != null && !job.getReportJson().isBlank()
+                    && (job.getStatus() == VerificationJob.Status.DONE
+                        || job.getStatus() == VerificationJob.Status.NEEDS_MORE_DOCUMENTS)) {
                 try {
                     Object report = objectMapper.readValue(job.getReportJson(), Object.class);
                     response.put("report", report);
                 } catch (Exception e) {
                     response.put("report", null);
                 }
+            }
+
+            // Missing documents flagged by the last run (empty once verification passes DONE)
+            if (job.getMissingDocumentsJson() != null && !job.getMissingDocumentsJson().isBlank()) {
+                try {
+                    List<?> missing = objectMapper.readValue(job.getMissingDocumentsJson(), List.class);
+                    response.put("missingDocuments", missing);
+                } catch (Exception e) {
+                    response.put("missingDocuments", List.of());
+                }
+            } else {
+                response.put("missingDocuments", List.of());
             }
 
             // Document info
@@ -225,62 +248,10 @@ public class VerificationController {
                 }
             }
 
-            // Follow-up chat history (empty until the user asks a question)
-            if (job.getChatHistoryJson() != null && !job.getChatHistoryJson().isBlank()) {
-                try {
-                    List<?> chat = objectMapper.readValue(job.getChatHistoryJson(), List.class);
-                    response.put("chatHistory", chat);
-                } catch (Exception e) {
-                    response.put("chatHistory", List.of());
-                }
-            } else {
-                response.put("chatHistory", List.of());
-            }
-
             return ResponseEntity.ok(response);
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(Map.of("error", e.getMessage()));
-        }
-    }
-
-    /**
-     * Ask a follow-up, chat-style question about a completed verification session
-     * (e.g. "What is link document?"). Answered in Markdown, grounded in the uploaded documents.
-     */
-    @PostMapping("/{sessionId}/ask")
-    public ResponseEntity<?> askQuestion(@PathVariable Long sessionId, @RequestBody Map<String, String> request) {
-        try {
-            String question = request.get("question");
-            if (question == null || question.isBlank()) {
-                return ResponseEntity.badRequest().body(Map.of("error", "Question must not be empty"));
-            }
-
-            String answer = verificationService.askQuestion(sessionId, question);
-
-            Optional<VerificationJob> optJob = jobRepository.findById(sessionId);
-            List<?> chatHistory = List.of();
-            if (optJob.isPresent() && optJob.get().getChatHistoryJson() != null) {
-                try {
-                    chatHistory = objectMapper.readValue(optJob.get().getChatHistoryJson(), List.class);
-                } catch (Exception ignored) {
-                    // keep default empty list
-                }
-            }
-
-            return ResponseEntity.ok(Map.of(
-                    "sessionId", sessionId,
-                    "answer", answer,
-                    "chatHistory", chatHistory
-            ));
-        } catch (IllegalArgumentException e) {
-            return ResponseEntity.notFound().build();
-        } catch (IllegalStateException e) {
-            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
-        } catch (Exception e) {
-            log.error("Failed to answer question for session {}", sessionId, e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(Map.of("error", "Failed to answer question: " + e.getMessage()));
         }
     }
 
