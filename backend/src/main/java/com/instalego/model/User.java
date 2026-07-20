@@ -7,27 +7,29 @@ import lombok.AllArgsConstructor;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "bank_templates")
+@Table(name = "users")
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class BankTemplate {
+public class User {
+
+    public enum Role {
+        USER, ADMIN
+    }
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "bank_id", nullable = false)
-    private Long bankId;
+    @Column(nullable = false, unique = true)
+    private String email;
 
-    @Column(name = "template_pdf_path", nullable = false)
-    private String templatePdfPath;
+    @Column(name = "password_hash", nullable = false)
+    private String passwordHash;
 
-    @Column(name = "field_schema", columnDefinition = "TEXT")
-    private String fieldSchema; // JSON string — list of {fieldName, description, type, required}
-
-    @Column(nullable = false)
-    private Integer version = 1;
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, columnDefinition = "varchar(20)")
+    private Role role = Role.USER;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;

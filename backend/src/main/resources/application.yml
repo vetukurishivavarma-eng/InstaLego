@@ -1,11 +1,14 @@
 server:
   port: 8080
+  compression:
+    enabled: true
+    mime-types: application/json,application/pdf,text/plain,text/css,application/javascript
 
 spring:
   servlet:
     multipart:
-      max-file-size: 15MB
-      max-request-size: 20MB
+      max-file-size: 30MB
+      max-request-size: 32MB
   datasource:
     url: jdbc:h2:file:./data/instalego
     driver-class-name: org.h2.Driver
@@ -27,9 +30,14 @@ spring:
 # File uploads directory
 app:
   upload-dir: ${UPLOAD_DIR:./uploads}
-  gemini-api-url: https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL:gemini-3.5-flash}:generateContent
   groq-api-url: ${GROQ_API_URL:https://api.groq.com/openai/v1/chat/completions}
-  groq-model: ${GROQ_MODEL:llama-3.3-70b-versatile}
+  groq-model: ${GROQ_MODEL:openai/gpt-oss-120b}
+  # Model availability varies by Groq account/tier — llama-4-scout returned 404 "not available" on
+  # a real test account, so this defaults to qwen3.6-27b, which was verified (via a direct API
+  # probe) to actually accept image input on that account.
+  groq-vision-model: ${GROQ_VISION_MODEL:qwen/qwen3.6-27b}
+  # Dev-only default — always set a real JWT_SECRET env var in any shared/production environment.
+  jwt-secret: ${JWT_SECRET:dev-only-insecure-secret-change-me-1234567890}
 
 ---
 # PostgreSQL configuration for production
@@ -38,7 +46,10 @@ spring:
     activate:
       on-profile: prod
   datasource:
-    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}
+    # sslmode=require is mandatory for managed Postgres providers like Neon; harmless elsewhere.
+    # currentSchema keeps all of InstaLego's tables isolated in their own schema rather than the
+    # database's default "public" schema — safe to share a database with other unrelated data.
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}?sslmode=require&currentSchema=${DB_SCHEMA:instalego}
     driver-class-name: org.postgresql.Driver
     username: ${DB_USERNAME:${DATABASE_USERNAME}}
     password: ${DB_PASSWORD:${DATABASE_PASSWORD}}
@@ -46,6 +57,7 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
+        default_schema: ${DB_SCHEMA:instalego}
   h2:
     console:
       enabled: false

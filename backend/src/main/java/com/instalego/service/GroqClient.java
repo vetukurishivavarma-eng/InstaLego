@@ -30,6 +30,15 @@ public class GroqClient {
     @Value("${app.groq-model}")
     private String groqModel;
 
+    @Value("${app.groq-vision-model}")
+    private String groqVisionModel;
+
+    // Some Groq accounts/tiers cap vision models at a very low tokens-per-minute budget (observed:
+    // 8000 TPM on qwen3.6-27b for a free/on-demand tier) — batching multiple page images into one
+    // request multiplies image-token cost and blows through that fast, so pages are sent one at a
+    // time rather than in batches of 5.
+    private static final int MAX_IMAGES_PER_REQUEST = 1;
+
     /**
      * Expose the configured model name for logging purposes.
      */
@@ -90,6 +99,177 @@ public class GroqClient {
         return callGroqInternal(systemMessage, userPrompt, true);
     }
 
+    /**
+     * Read a bank's sample verification report and describe its structure as a numbered list of
+     * sections — the same plain-text shape as the built-in default structure — so it can be
+     * dropped directly into the verification prompt as a "follow this structure" instruction.
+     */
+    public String deriveReportStructure(String sampleReportText) {
+        String systemMessage = "You are a document structure analyst. Read the sample legal/verification " +
+                "report below and describe its structure as a numbered list of sections (what each section " +
+                "covers, in the order it appears). Do not include the sample's actual data/findings — only " +
+                "the structural outline, written so it can be handed to another analyst as instructions for " +
+                "producing a new report in the same shape.";
+
+        String userPrompt = "SAMPLE REPORT:\n" + sampleReportText;
+
+        return callGroqInternal(systemMessage, userPrompt, false).trim();
+    }
+
+    /**
+     * Transcribe visible text from a set of page images using Groq's open-weight vision model
+     * (meta-llama/llama-4-scout by default). Used as the OCR fallback for scanned/image-only
+     * documents where PDFBox/Tika found no embedded text layer.
+     *
+     * Groq's vision endpoint accepts at most {@value #MAX_IMAGES_PER_REQUEST} images per request,
+     * so multi-page documents are sent in batches and the transcriptions concatenated in order.
+     *
+     * @param jpegImages JPEG-encoded page images, in reading order
+     * @return The full transcribed text across all pages
+     */
+    public String transcribeImages(List<byte[]> jpegImages) {
+        StringBuilder result = new StringBuilder();
+        for (int start = 0; start < jpegImages.size(); start += MAX_IMAGES_PER_REQUEST) {
+            List<byte[]> batch = jpegImages.subList(start, Math.min(start + MAX_IMAGES_PER_REQUEST, jpegImages.size()));
+            String batchText = callGroqVision(batch);
+            if (batchText != null && !batchText.isBlank()) {
+                if (result.length() > 0) result.append("\n\n");
+                result.append(batchText);
+            }
+        }
+        return result.toString();
+    }
+
+    /**
+     * Reasoning models (e.g. Qwen) may emit hidden chain-of-thought inside a {@code <think>...
+     * </think>} block ahead of the actual answer, even when instructed not to. Strip it
+     * defensively so it never ends up mixed into transcribed document text.
+     */
+    private String stripReasoning(String text) {
+        if (text == null) return "";
+        return text.replaceAll("(?s)<think>.*?</think>", "").trim();
+    }
+
+    private static final java.util.regex.Pattern RETRY_AFTER_PATTERN =
+            java.util.regex.Pattern.compile("try again in ([0-9.]+)s", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Groq's 429 responses include the exact wait time needed (e.g. "Please try again in
+     * 1.1775s") — honor that instead of blind exponential backoff, since a fixed 1s/2s schedule
+     * can either under-wait (still gets rejected) or over-wait relative to what's actually needed.
+     * Falls back to exponential backoff if the hint isn't present.
+     */
+    private long resolveRetryDelayMs(String responseBody, int attempt, int baseDelayMs) {
+        var matcher = RETRY_AFTER_PATTERN.matcher(responseBody);
+        if (matcher.find()) {
+            double seconds = Double.parseDouble(matcher.group(1));
+            return (long) (seconds * 1000) + 300; // small buffer for latency/clock skew
+        }
+        return baseDelayMs * (long) Math.pow(2, attempt - 1);
+    }
+
+    private String callGroqVision(List<byte[]> jpegBatch) {
+        String apiKey = System.getenv("GROQ_API_KEY");
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException("GROQ_API_KEY environment variable is not set");
+        }
+
+        try {
+            ObjectNode requestBody = objectMapper.createObjectNode();
+            requestBody.put("model", groqVisionModel);
+
+            ArrayNode messages = requestBody.putArray("messages");
+
+            ObjectNode sysMsg = messages.addObject();
+            sysMsg.put("role", "system");
+            sysMsg.put("content", "You are a precise OCR/transcription engine. Transcribe ALL visible text " +
+                    "exactly as it appears, preserving paragraph structure. Do not summarize, translate, or " +
+                    "add commentary — output only the transcribed text. If a page has no readable text, skip it. " +
+                    "Do not show your reasoning or use <think> tags — respond with the transcription only.");
+
+            ObjectNode userMsg = messages.addObject();
+            userMsg.put("role", "user");
+            ArrayNode content = userMsg.putArray("content");
+
+            ObjectNode textPart = content.addObject();
+            textPart.put("type", "text");
+            textPart.put("text", "Transcribe the visible text from the following page image(s), in order.");
+
+            for (byte[] jpeg : jpegBatch) {
+                ObjectNode imagePart = content.addObject();
+                imagePart.put("type", "image_url");
+                ObjectNode imageUrl = imagePart.putObject("image_url");
+                imageUrl.put("url", "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jpeg));
+            }
+
+            requestBody.put("temperature", 0.1);
+            // Kept modest to fit within restrictive per-account TPM budgets on vision models (see
+            // MAX_IMAGES_PER_REQUEST) — still enough for one page's transcription plus some
+            // hidden reasoning overhead on models like Qwen.
+            requestBody.put("max_tokens", 2000);
+
+            String requestJson = objectMapper.writeValueAsString(requestBody);
+
+            int maxRetries = 5;
+            int baseDelayMs = 1000;
+            IOException lastException = null;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    HttpRequest request = HttpRequest.newBuilder()
+                            .uri(URI.create(groqApiUrl))
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", "Bearer " + apiKey)
+                            .timeout(Duration.ofSeconds(60))
+                            .POST(HttpRequest.BodyPublishers.ofString(requestJson))
+                            .build();
+
+                    HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                    int statusCode = response.statusCode();
+                    String responseBody = response.body();
+
+                    if (statusCode == 200) {
+                        JsonNode root = objectMapper.readTree(responseBody);
+                        JsonNode choices = root.get("choices");
+                        if (choices != null && choices.isArray() && choices.size() > 0) {
+                            JsonNode message = choices.get(0).get("message");
+                            if (message != null && message.has("content")) {
+                                return stripReasoning(message.get("content").asText()).trim();
+                            }
+                        }
+                        throw new RuntimeException("Unexpected Groq vision response structure: " + responseBody);
+                    } else if (statusCode == 429 && attempt < maxRetries) {
+                        long delay = resolveRetryDelayMs(responseBody, attempt, baseDelayMs);
+                        log.warn("Groq vision API rate limited (429), retrying in {}ms (attempt {}/{})", delay, attempt, maxRetries);
+                        Thread.sleep(delay);
+                        continue;
+                    } else {
+                        throw new RuntimeException("Groq vision API returned status " + statusCode + ": " + responseBody);
+                    }
+                } catch (IOException e) {
+                    lastException = e;
+                    if (attempt < maxRetries) {
+                        long delay = baseDelayMs * (long) Math.pow(2, attempt - 1);
+                        log.warn("Groq vision API request failed, retrying in {}ms (attempt {}/{})", delay, attempt, maxRetries);
+                        Thread.sleep(delay);
+                    }
+                }
+            }
+
+            if (lastException != null) {
+                throw new RuntimeException("Groq vision API request failed after " + maxRetries + " retries", lastException);
+            }
+            throw new RuntimeException("Groq vision API request failed after " + maxRetries + " retries");
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Groq vision API request interrupted", e);
+        } catch (Exception e) {
+            if (e instanceof RuntimeException) throw (RuntimeException) e;
+            throw new RuntimeException("Groq vision API call failed", e);
+        }
+    }
+
     private String callGroq(String prompt) {
         return callGroqInternal("You are a precise document processing engine. Always return valid JSON only.", prompt, true);
     }
@@ -133,8 +313,9 @@ public class GroqClient {
                     systemMessage.substring(0, Math.min(100, systemMessage.length())),
                     userMessage.substring(0, Math.min(200, userMessage.length())));
 
-            // Retry logic with exponential backoff (handles 429 rate limits)
-            int maxRetries = 3;
+            // Retry logic honoring Groq's suggested wait time on 429s (falls back to exponential
+            // backoff if the response doesn't include one)
+            int maxRetries = 5;
             int baseDelayMs = 1000;
             IOException lastException = null;
 
@@ -169,7 +350,7 @@ public class GroqClient {
                         }
                         throw new RuntimeException("Unexpected Groq response structure: " + responseBody);
                     } else if (statusCode == 429 && attempt < maxRetries) {
-                        int delay = baseDelayMs * (int) Math.pow(2, attempt - 1);
+                        long delay = resolveRetryDelayMs(responseBody, attempt, baseDelayMs);
                         log.warn("Groq API rate limited (429), retrying in {}ms (attempt {}/{})", delay, attempt, maxRetries);
                         Thread.sleep(delay);
                         continue;
@@ -179,7 +360,7 @@ public class GroqClient {
                 } catch (IOException e) {
                     lastException = e;
                     if (attempt < maxRetries) {
-                        int delay = baseDelayMs * (int) Math.pow(2, attempt - 1);
+                        long delay = baseDelayMs * (long) Math.pow(2, attempt - 1);
                         log.warn("Groq API request failed, retrying in {}ms (attempt {}/{})", delay, attempt, maxRetries);
                         Thread.sleep(delay);
                     }

@@ -1,0 +1,43 @@
+services:
+  # Backend — Spring Boot API (Docker), free web service.
+  # Database is external (Neon) rather than a Render-managed Postgres, since Render's free
+  # Postgres expires 30 days after creation — Neon's free tier has no such expiry.
+  - type: web
+    name: instalego-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "5432"
+      - key: DB_NAME
+        sync: false
+      - key: DATABASE_USERNAME
+        sync: false
+      - key: DATABASE_PASSWORD
+        sync: false
+
+  # Frontend — static build, free static site (no spin-down/ephemeral-disk concerns; it's just files).
+  - type: web
+    name: instalego-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      # Update this if Render assigns a different backend URL than expected (e.g. the name was
+      # already taken) — check the backend service's actual URL in the Render dashboard.
+      - key: VITE_API_URL
+        value: https://instalego-backend.onrender.com

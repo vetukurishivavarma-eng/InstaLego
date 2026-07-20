@@ -40,7 +40,9 @@ public class ReferenceController {
             Path uploadPath = Path.of(uploadDir, "references", String.valueOf(bankId));
             Files.createDirectories(uploadPath);
             Path filePath = uploadPath.resolve(fileName);
-            file.transferTo(filePath.toFile());
+            // A relative File resolves against the servlet container's temp dir, not the app's
+            // working directory — always transfer to an absolute path.
+            file.transferTo(filePath.toAbsolutePath().toFile());
 
             LegalReference ref = new LegalReference();
             ref.setBankId(bankId);

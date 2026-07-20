@@ -13,6 +13,7 @@ backend/uploads/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/tsconfig.tsbuildinfo
 
 # IDE
 .idea/

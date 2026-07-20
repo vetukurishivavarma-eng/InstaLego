@@ -2,7 +2,31 @@
 // In production, set VITE_API_URL to the backend URL (e.g., https://instalego-backend.onrender.com)
 const API_BASE = (import.meta.env.VITE_API_URL || '') + '/api';
 
+const TOKEN_KEY = 'instalego_token';
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+/** Set by AuthContext so a 401 from any request can immediately clear the session. */
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(handler: () => void): void {
+  onUnauthorized = handler;
+}
+
 async function handleResponse<T>(response: Response): Promise<T> {
+  if (response.status === 401) {
+    clearToken();
+    if (onUnauthorized) onUnauthorized();
+  }
   if (!response.ok) {
     const errorBody = await response.text();
     let errorMessage: string;
@@ -17,33 +41,34 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.json();
 }
 
+function authHeaders(): Record<string, string> {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: { ...authHeaders(), ...(options.headers || {}) },
+  });
+  return handleResponse<T>(res);
+}
+
+async function requestForm<T>(path: string, method: string, formData: FormData): Promise<T> {
+  return request<T>(path, { method, body: formData });
+}
+
+async function requestJson<T>(path: string, method: string, body: unknown): Promise<T> {
+  return request<T>(path, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 export interface Bank {
   id: number;
   name: string;
-  createdAt: string;
-}
-
-export interface FieldSchemaEntry {
-  fieldName: string;
-  description: string;
-  type: 'text' | 'date' | 'number' | 'boolean';
-  required: boolean;
-}
-
-export interface TemplateUploadResponse {
-  templateId: number;
-  bankId: number;
-  templatePdfPath: string;
-  version: number;
-  derivedSchema: FieldSchemaEntry[];
-}
-
-export interface BankTemplate {
-  id: number;
-  bankId: number;
-  templatePdfPath: string;
-  fieldSchema: string;
-  version: number;
   createdAt: string;
 }
 
@@ -55,179 +80,112 @@ export interface LegalReference {
   createdAt: string;
 }
 
-export interface JobStatusResponse {
+export interface AuthResponse {
+  token: string;
+  email: string;
+  role: 'USER' | 'ADMIN';
+}
+
+export interface MySession {
   id: number;
   bankId: number;
   bankName: string;
   status: string;
-  extractedJson: string | null;
-  verificationReport: string | null;
-  errorMessage: string | null;
-  outputAvailable: boolean;
-  createdAt: string;
-}
-
-export interface CreateJobResponse {
-  id: number;
-  status: string;
+  verdict: string | null;
   createdAt: string;
 }
 
 export const api = {
+  // Auth
+  async register(email: string, password: string): Promise<AuthResponse> {
+    return requestJson<AuthResponse>('/auth/register', 'POST', { email, password });
+  },
+
+  async login(email: string, password: string): Promise<AuthResponse> {
+    return requestJson<AuthResponse>('/auth/login', 'POST', { email, password });
+  },
+
+  async me(): Promise<{ email: string; role: string }> {
+    return request('/auth/me');
+  },
+
   // Banks
   async createBank(name: string): Promise<Bank> {
-    const res = await fetch(`${API_BASE}/banks`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    return handleResponse<Bank>(res);
+    return requestJson<Bank>('/banks', 'POST', { name });
   },
 
   async getBanks(): Promise<Bank[]> {
-    const res = await fetch(`${API_BASE}/banks`);
-    return handleResponse<Bank[]>(res);
+    return request<Bank[]>('/banks');
   },
 
   async getBanksWithTemplate(): Promise<Bank[]> {
-    const res = await fetch(`${API_BASE}/banks/with-template`);
-    return handleResponse<Bank[]>(res);
-  },
-
-  // Templates
-  async uploadTemplate(bankId: number, file: File): Promise<TemplateUploadResponse> {
-    const formData = new FormData();
-    formData.append('file', file);
-    const res = await fetch(`${API_BASE}/banks/${bankId}/template`, {
-      method: 'POST',
-      body: formData,
-    });
-    return handleResponse<TemplateUploadResponse>(res);
-  },
-
-  async saveSchema(bankId: number, request: { derivedSchema: FieldSchemaEntry[] }): Promise<any> {
-    const res = await fetch(`${API_BASE}/banks/${bankId}/template`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
-    });
-    return handleResponse<any>(res);
-  },
-
-  async getTemplate(bankId: number): Promise<BankTemplate> {
-    const res = await fetch(`${API_BASE}/banks/${bankId}/template`);
-    return handleResponse<BankTemplate>(res);
-  },
-
-  async deleteTemplate(bankId: number): Promise<any> {
-    const res = await fetch(`${API_BASE}/banks/${bankId}/template`, {
-      method: 'DELETE',
-    });
-    return handleResponse<any>(res);
-  },
-
-  getTemplateDownloadUrl(bankId: number): string {
-    return `${API_BASE}/banks/${bankId}/template/download`;
-  },
-
-  // Jobs
-  async createJob(bankId: number, file: File): Promise<CreateJobResponse> {
-    const formData = new FormData();
-    formData.append('bankId', bankId.toString());
-    formData.append('file', file);
-    const res = await fetch(`${API_BASE}/jobs`, {
-      method: 'POST',
-      body: formData,
-    });
-    return handleResponse<CreateJobResponse>(res);
-  },
-
-  async getJobStatus(jobId: number): Promise<JobStatusResponse> {
-    const res = await fetch(`${API_BASE}/jobs/${jobId}`);
-    return handleResponse<JobStatusResponse>(res);
-  },
-
-  getJobOutputUrl(jobId: number): string {
-    return `${API_BASE}/jobs/${jobId}/output`;
+    return request<Bank[]>('/banks/with-template');
   },
 
   // Legal References
   async uploadReference(bankId: number, file: File): Promise<LegalReference> {
     const formData = new FormData();
     formData.append('file', file);
-    const res = await fetch(`${API_BASE}/banks/${bankId}/references`, {
-      method: 'POST',
-      body: formData,
-    });
-    return handleResponse<LegalReference>(res);
+    return requestForm<LegalReference>(`/banks/${bankId}/references`, 'POST', formData);
   },
 
   async getReferences(bankId: number): Promise<LegalReference[]> {
-    const res = await fetch(`${API_BASE}/banks/${bankId}/references`);
-    return handleResponse<LegalReference[]>(res);
+    return request<LegalReference[]>(`/banks/${bankId}/references`);
   },
 
   async deleteReference(bankId: number, referenceId: number): Promise<any> {
-    const res = await fetch(`${API_BASE}/banks/${bankId}/references/${referenceId}`, {
-      method: 'DELETE',
-    });
-    return handleResponse<any>(res);
+    return request(`/banks/${bankId}/references/${referenceId}`, { method: 'DELETE' });
   },
 
-  // Multi-Document Verification
+  // Multi-Document Verification ("Submit for Legal Opinion")
   async startVerification(bankId: number): Promise<any> {
     const formData = new FormData();
     formData.append('bankId', bankId.toString());
-    const res = await fetch(`${API_BASE}/verify/start`, {
-      method: 'POST',
-      body: formData,
-    });
-    return handleResponse<any>(res);
+    return requestForm('/verify/start', 'POST', formData);
   },
 
   async addVerificationDocument(sessionId: number, file: File, label: string): Promise<any> {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('label', label);
-    const res = await fetch(`${API_BASE}/verify/${sessionId}/add-document`, {
-      method: 'POST',
-      body: formData,
-    });
-    return handleResponse<any>(res);
+    return requestForm(`/verify/${sessionId}/add-document`, 'POST', formData);
   },
 
   async getVerificationStatus(sessionId: number): Promise<any> {
-    const res = await fetch(`${API_BASE}/verify/${sessionId}`);
-    return handleResponse<any>(res);
+    return request(`/verify/${sessionId}`);
   },
 
   async runVerification(sessionId: number): Promise<any> {
-    const res = await fetch(`${API_BASE}/verify/${sessionId}/run`, {
-      method: 'POST',
+    return request(`/verify/${sessionId}/run`, { method: 'POST' });
+  },
+
+  async getMySessions(): Promise<MySession[]> {
+    return request<MySession[]>('/verify/mine');
+  },
+
+  async downloadOpinionPdf(sessionId: number): Promise<Blob> {
+    const res = await fetch(`${API_BASE}/verify/${sessionId}/opinion.pdf`, {
+      headers: authHeaders(),
     });
-    return handleResponse<any>(res);
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(body || `HTTP ${res.status}`);
+    }
+    return res.blob();
   },
 
   // Report Format (Admin)
   async uploadReportFormat(bankId: number, file: File): Promise<any> {
     const formData = new FormData();
     formData.append('file', file);
-    const res = await fetch(`${API_BASE}/banks/${bankId}/report-format`, {
-      method: 'POST',
-      body: formData,
-    });
-    return handleResponse<any>(res);
+    return requestForm(`/banks/${bankId}/report-format`, 'POST', formData);
   },
 
   async getReportFormat(bankId: number): Promise<any> {
-    const res = await fetch(`${API_BASE}/banks/${bankId}/report-format`);
-    return handleResponse<any>(res);
+    return request(`/banks/${bankId}/report-format`);
   },
 
   async deleteReportFormat(bankId: number): Promise<any> {
-    const res = await fetch(`${API_BASE}/banks/${bankId}/report-format`, {
-      method: 'DELETE',
-    });
-    return handleResponse<any>(res);
+    return request(`/banks/${bankId}/report-format`, { method: 'DELETE' });
   },
 };

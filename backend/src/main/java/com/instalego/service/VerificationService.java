@@ -7,11 +7,12 @@ import com.instalego.model.VerificationJob;
 import com.instalego.repository.VerificationJobRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.tika.Tika;
+import org.apache.pdfbox.rendering.PDFRenderer;
 import org.springframework.stereotype.Service;
 
-import java.io.FileInputStream;
-import java.io.InputStream;
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -24,10 +25,21 @@ public class VerificationService {
     private final VerificationJobRepository jobRepository;
     private final BankService bankService;
     private final GroqClient groqClient;
-    private final GeminiService geminiService;
+    private final TextExtractionService textExtractionService;
     private final ObjectMapper objectMapper;
 
-    private static final Tika TIKA = new Tika();
+    private static final int OCR_RENDER_DPI = 150;
+
+    // --- Context-window safety (map-reduce for large files) ---
+    // gpt-oss-120b's context window is 131,072 tokens. These budgets stay well under that so a
+    // 30MB file's extracted text can never overflow the window regardless of how large it is —
+    // it just does more (cheap, fast) round-trips instead of risking a single oversized call.
+    private static final int CHARS_PER_TOKEN_ESTIMATE = 4;
+    private static final int SINGLE_CALL_TOKEN_BUDGET = 90_000;
+    private static final int BATCH_TOKEN_BUDGET = 25_000;
+    private static final int DOC_SLICE_CHARS = 90_000; // ~22.5k tokens, for one oversized document
+
+    private record DocText(String label, String text) {}
 
     /**
      * Default legal verification report structure used when a bank hasn't uploaded its own
@@ -72,6 +84,7 @@ public class VerificationService {
             // Extract text from each document (sequential to minimize peak memory)
             List<String> thinkingSteps = new ArrayList<>();
             StringBuilder allDocsText = new StringBuilder();
+            List<DocText> docTexts = new ArrayList<>();
 
             for (int i = 0; i < documents.size(); i++) {
                 Map<String, Object> doc = documents.get(i);
@@ -82,22 +95,23 @@ public class VerificationService {
                 job.setCurrentPhase("Extracting: " + fileName + "...");
                 jobRepository.save(job);
 
-                String extractedText = extractText(Path.of(filePath), fileType);
+                String extractedText = textExtractionService.extractText(Path.of(filePath), fileType);
                 String label = (String) doc.getOrDefault("label", fileName);
 
                 // If normal text extraction found nothing (typical for scanned/image-only PDFs
-                // or photos, which have no embedded text layer), fall back to AI OCR via Gemini.
+                // or photos, which have no embedded text layer), fall back to Groq's vision model for OCR.
                 if ((extractedText == null || extractedText.isBlank()) && isOcrEligible(fileType)) {
-                    String ocrText = tryGeminiOcr(Path.of(filePath), fileType);
+                    String ocrText = tryGroqVisionOcr(Path.of(filePath), fileType);
                     if (ocrText != null && !ocrText.isBlank()) {
                         extractedText = ocrText;
-                        thinkingSteps.add("🔎 Used AI vision (Gemini) to read scanned/image content from \"" + label + "\"");
+                        thinkingSteps.add("🔎 Used open-source vision AI to read scanned/image content from \"" + label + "\"");
                     }
                 }
 
                 if (extractedText != null && !extractedText.isBlank()) {
                     allDocsText.append("--- Document ").append(i + 1).append(": \"").append(label).append("\" ---\n");
                     allDocsText.append(extractedText).append("\n\n");
+                    docTexts.add(new DocText(label, extractedText));
 
                     thinkingSteps.add("📄 Extracted text from \"" + label + "\" (" + extractedText.length() + " chars)");
                 } else {
@@ -118,9 +132,18 @@ public class VerificationService {
             job.setThinkingSteps(toJson(thinkingSteps));
             jobRepository.save(job);
 
-            // Build optimized single prompt with ALL documents
-            Map<String, Object> verificationResult = callGroqForVerification(
-                    allDocsText.toString(), documents.size(), reportStructure);
+            // Under budget: one prompt with everything. Over budget: map-reduce so a large file
+            // can never overflow the model's context window (see constants above).
+            int estimatedTokens = allDocsText.length() / CHARS_PER_TOKEN_ESTIMATE;
+            Map<String, Object> verificationResult;
+            if (estimatedTokens <= SINGLE_CALL_TOKEN_BUDGET) {
+                verificationResult = callGroqForVerification(allDocsText.toString(), documents.size(), reportStructure);
+            } else {
+                thinkingSteps.add("📚 Large document set (~" + estimatedTokens + " tokens) — analyzing in batches to stay within model limits");
+                job.setThinkingSteps(toJson(thinkingSteps));
+                jobRepository.save(job);
+                verificationResult = callGroqForVerificationChunked(docTexts, documents.size(), reportStructure, job, thinkingSteps);
+            }
 
             // Extract thinking steps from the AI response
             @SuppressWarnings("unchecked")
@@ -184,13 +207,17 @@ public class VerificationService {
         return "INFO";
     }
 
-    private Map<String, Object> callGroqForVerification(String allDocsText, int docCount, String reportStructure)
-            throws JsonProcessingException {
-
-        String structureInstructions = (reportStructure != null && !reportStructure.isBlank())
+    private String buildStructureInstructions(String reportStructure) {
+        return (reportStructure != null && !reportStructure.isBlank())
                 ? "Follow this bank's report structure exactly:\n" + reportStructure
                 : "No bank-specific template was provided — use this default legal verification report structure:\n"
                 + DEFAULT_REPORT_STRUCTURE;
+    }
+
+    private Map<String, Object> callGroqForVerification(String allDocsText, int docCount, String reportStructure)
+            throws JsonProcessingException {
+
+        String structureInstructions = buildStructureInstructions(reportStructure);
 
         String systemMessage = "You are a legal document verification expert working on behalf of a bank/lender. " +
                 "Your job is to determine whether the submitted document(s) are legally valid and whether the " +
@@ -284,6 +311,227 @@ public class VerificationService {
         return parseVerificationResponse(response);
     }
 
+    /**
+     * Map-reduce path for document sets too large to safely fit in a single prompt. Map phase
+     * extracts structured per-document facts in small batches (bounded prompt size regardless of
+     * how large the source file is); reduce phase does the cross-referencing, missing-document
+     * detection, and verdict using only those compact facts — so its payload stays small even
+     * when the original file was huge.
+     */
+    private Map<String, Object> callGroqForVerificationChunked(
+            List<DocText> docTexts, int docCount, String reportStructure,
+            VerificationJob job, List<String> thinkingSteps) throws JsonProcessingException {
+
+        List<DocText> slices = sliceOversizedDocuments(docTexts);
+        List<List<DocText>> batches = packIntoBatches(slices);
+
+        List<Object> allDocumentsAnalyzed = new ArrayList<>();
+        List<String> allReferencedNotes = new ArrayList<>();
+
+        for (int b = 0; b < batches.size(); b++) {
+            List<DocText> batch = batches.get(b);
+            job.setCurrentPhase("Analyzing batch " + (b + 1) + " of " + batches.size() + "...");
+            jobRepository.save(job);
+
+            Map<String, Object> batchResult = callGroqForBatchExtraction(batch);
+
+            Object docsAnalyzed = batchResult.get("documentsAnalyzed");
+            if (docsAnalyzed instanceof List<?> list) allDocumentsAnalyzed.addAll(list);
+
+            Object refNotes = batchResult.get("referencedDocuments");
+            if (refNotes instanceof List<?> list) {
+                for (Object o : list) allReferencedNotes.add(String.valueOf(o));
+            }
+
+            thinkingSteps.add("🤖 Analyzed batch " + (b + 1) + "/" + batches.size() + " (" + batch.size() + " document part(s))");
+            job.setThinkingSteps(toJson(thinkingSteps));
+            jobRepository.save(job);
+        }
+
+        job.setCurrentPhase("Cross-referencing findings across all documents and finalizing verdict...");
+        jobRepository.save(job);
+
+        return callGroqForReduce(allDocumentsAnalyzed, allReferencedNotes, docCount, reportStructure);
+    }
+
+    /** Splits any single document whose text alone exceeds the per-batch budget into ordered parts. */
+    private List<DocText> sliceOversizedDocuments(List<DocText> docTexts) {
+        List<DocText> result = new ArrayList<>();
+        for (DocText doc : docTexts) {
+            if (doc.text().length() <= DOC_SLICE_CHARS) {
+                result.add(doc);
+                continue;
+            }
+            int totalParts = (int) Math.ceil(doc.text().length() / (double) DOC_SLICE_CHARS);
+            for (int p = 0; p < totalParts; p++) {
+                int start = p * DOC_SLICE_CHARS;
+                int end = Math.min(start + DOC_SLICE_CHARS, doc.text().length());
+                result.add(new DocText(doc.label() + " (part " + (p + 1) + "/" + totalParts + ")", doc.text().substring(start, end)));
+            }
+        }
+        return result;
+    }
+
+    /** Greedily packs document (or document-slice) texts into batches under the per-batch token budget. */
+    private List<List<DocText>> packIntoBatches(List<DocText> docTexts) {
+        List<List<DocText>> batches = new ArrayList<>();
+        List<DocText> current = new ArrayList<>();
+        int currentChars = 0;
+        int batchCharBudget = BATCH_TOKEN_BUDGET * CHARS_PER_TOKEN_ESTIMATE;
+
+        for (DocText doc : docTexts) {
+            if (!current.isEmpty() && currentChars + doc.text().length() > batchCharBudget) {
+                batches.add(current);
+                current = new ArrayList<>();
+                currentChars = 0;
+            }
+            current.add(doc);
+            currentChars += doc.text().length();
+        }
+        if (!current.isEmpty()) batches.add(current);
+        return batches;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> callGroqForBatchExtraction(List<DocText> batch) {
+        String docsBlock = batch.stream()
+                .map(d -> "--- \"" + d.label() + "\" ---\n" + d.text())
+                .reduce((a, c) -> a + "\n\n" + c)
+                .orElse("");
+
+        String systemMessage = "You are a legal document analyst extracting structured facts from document " +
+                "excerpts (part of a larger multi-document legal verification). Return ONLY valid JSON. " +
+                "No markdown fences, no preamble.";
+
+        String userPrompt = """
+                Analyze the following document excerpt(s):
+
+                %s
+
+                TASK:
+                1. For EACH document/part provided, extract and record: document type, date, parties,
+                   reference or registration numbers, amounts, property/subject details, and key clauses.
+                2. Check legal validity indicators for each: proper execution, signatures, witness
+                   attestations, notarization, registration compliance, stamp duty payment, etc. Note any
+                   issues found.
+                3. List any OTHER document referenced INSIDE this excerpt that would be needed to establish
+                   a complete chain of title (e.g. a prior sale deed, gift deed, partition deed, release
+                   deed, power of attorney, encumbrance certificate, NOC, mortgage release, court order) —
+                   as plain-language notes, one per reference, with enough detail (doc number/date/
+                   description) to match it later against the full document set.
+
+                Return JSON in this exact format:
+                {
+                  "documentsAnalyzed": [
+                    {
+                      "name": "Document name",
+                      "type": "Sale Deed / Prior Sale Deed / etc.",
+                      "keyDetails": {
+                        "date": "...", "parties": ["..."], "referenceNumbers": ["..."],
+                        "amounts": ["..."], "keyClauses": ["..."]
+                      },
+                      "findings": ["Finding 1..."],
+                      "issues": ["Issue 1..."],
+                      "status": "VALID / MINOR_ISSUES / INVALID"
+                    }
+                  ],
+                  "referencedDocuments": [
+                    "e.g. Sale Deed dated 07-09-2016, Doc No. 5185/2016, referenced as the source of title"
+                  ]
+                }
+                """.formatted(docsBlock);
+
+        try {
+            String response = groqClient.sendPrompt(systemMessage, userPrompt);
+            Map<String, Object> parsed = objectMapper.readValue(response, Map.class);
+            parsed.putIfAbsent("documentsAnalyzed", List.of());
+            parsed.putIfAbsent("referencedDocuments", List.of());
+            return parsed;
+        } catch (Exception e) {
+            log.warn("Batch extraction failed for {} document part(s), skipping this batch: {}", batch.size(), e.getMessage());
+            return Map.of("documentsAnalyzed", List.of(), "referencedDocuments", List.of());
+        }
+    }
+
+    private Map<String, Object> callGroqForReduce(
+            List<Object> documentsAnalyzed, List<String> referencedNotes, int docCount, String reportStructure)
+            throws JsonProcessingException {
+
+        String structureInstructions = buildStructureInstructions(reportStructure);
+        String documentsAnalyzedJson = objectMapper.writeValueAsString(documentsAnalyzed);
+        String referencedNotesBlock = referencedNotes.isEmpty()
+                ? "(none noted)"
+                : referencedNotes.stream().map(n -> "- " + n).reduce((a, c) -> a + "\n" + c).orElse("(none noted)");
+
+        String systemMessage = "You are a legal document verification expert working on behalf of a bank/lender. " +
+                "You will be given the already-extracted structured analysis of a document set (not the raw " +
+                "text) and must finalize the verification. Return ONLY valid JSON. No markdown fences, no preamble.";
+
+        String userPrompt = String.format("""
+                You have the extracted analysis of %d document(s) submitted for legal verification. The raw
+                documents were too large to analyze in one pass, so they were pre-processed into the
+                structured facts below.
+
+                %s
+
+                DOCUMENTS ANALYZED (structured facts, not raw text):
+                %s
+
+                DOCUMENTS REFERENCED INSIDE THE ABOVE (candidates to check against what's already analyzed):
+                %s
+
+                TASK:
+                1. For each candidate referenced document above, check whether it matches (by document
+                   number, date, or description) one of the documents already analyzed. If NOT matched, add
+                   it to "missingDocuments" with a clear, plain-language description of what to upload and
+                   why it's needed.
+                2. Cross-reference the analyzed documents against each other: do names, dates, amounts, and
+                   reference numbers match consistently? Flag any MISMATCH.
+                3. Decide the verdict:
+                   - "INCOMPLETE" if missingDocuments is non-empty.
+                   - "FAIL" if all referenced documents are present but there are legal defects, missing
+                     signatures/registration, or unresolved mismatches.
+                   - "PASS" if all referenced documents are present, cross-references are consistent, and no
+                     legal defects were found.
+                4. Write a clear "overallVerdict" explaining the reasoning in plain language, and concrete
+                   "recommendations" for next steps.
+
+                Do NOT re-list "documentsAnalyzed" in your response — it will be attached separately from
+                the structured facts already provided above. Only return the fields below.
+
+                Return JSON in this exact format:
+                {
+                  "reasoningSteps": ["Step 1...", "Step 2...", ...],
+                  "report": {
+                    "title": "Legal Verification Report",
+                    "missingDocuments": [
+                      {"description": "...", "reason": "...", "referencedIn": "..."}
+                    ],
+                    "crossReferenceCheck": [
+                      {"documents": ["Doc A", "Doc B"], "field": "...", "valueInDocA": "...", "valueInDocB": "...", "status": "MATCH / MISMATCH / INFO", "detail": "..."}
+                    ],
+                    "overallVerdict": "Detailed overall assessment...",
+                    "recommendations": ["Recommendation 1..."],
+                    "verdict": "PASS / FAIL / INCOMPLETE"
+                  }
+                }
+                """, docCount, structureInstructions, documentsAnalyzedJson, referencedNotesBlock);
+
+        String response = groqClient.sendPrompt(systemMessage, userPrompt);
+        Map<String, Object> parsed = parseVerificationResponse(response);
+
+        // Attach the map-phase facts ourselves rather than trusting the model to echo back a
+        // potentially large array verbatim — guarantees nothing gets dropped or altered.
+        Object reportObj = parsed.get("report");
+        if (reportObj instanceof Map<?, ?> reportMap) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> report = (Map<String, Object>) reportMap;
+            report.put("documentsAnalyzed", documentsAnalyzed);
+        }
+
+        return parsed;
+    }
+
     @SuppressWarnings("unchecked")
     private Map<String, Object> parseVerificationResponse(String response) {
         try {
@@ -343,55 +591,49 @@ public class VerificationService {
     }
 
     /**
-     * Sends the raw file to Gemini's multimodal model to transcribe visible text, for documents
-     * where PDFBox/Tika found no embedded text layer (e.g. scans or photos of documents).
+     * Reads visible text from documents where PDFBox/Tika found no embedded text layer (e.g.
+     * scans or photos), using Groq's open-weight vision model. PDFs are rasterized page-by-page
+     * (Groq's vision endpoint takes images only) and sent in batches; plain image uploads go
+     * through as a single image.
      */
-    private String tryGeminiOcr(Path filePath, String fileType) {
+    private String tryGroqVisionOcr(Path filePath, String fileType) {
         try {
-            byte[] bytes = Files.readAllBytes(filePath);
-            String base64 = Base64.getEncoder().encodeToString(bytes);
-            String mimeType = "PDF".equalsIgnoreCase(fileType) ? "application/pdf" : guessImageMimeType(filePath);
-            return geminiService.extractRawText(base64, mimeType);
+            List<byte[]> pageImages = "PDF".equalsIgnoreCase(fileType)
+                    ? rasterizePdfPages(filePath)
+                    : List.of(reencodeAsJpeg(Files.readAllBytes(filePath)));
+
+            if (pageImages.isEmpty()) return null;
+
+            return groqClient.transcribeImages(pageImages);
         } catch (Exception e) {
-            log.warn("Gemini OCR fallback failed for {}: {}", filePath, e.getMessage());
+            log.warn("Groq vision OCR fallback failed for {}: {}", filePath, e.getMessage());
             return null;
         }
     }
 
-    private String guessImageMimeType(Path filePath) {
-        String name = filePath.getFileName().toString().toLowerCase();
-        if (name.endsWith(".png")) return "image/png";
-        if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
-        if (name.endsWith(".webp")) return "image/webp";
-        return "image/jpeg";
-    }
-
-    private String extractText(Path filePath, String fileType) {
-        try {
-            String ext = fileType != null ? fileType.toUpperCase() : "";
-            if ("PDF".equals(ext)) {
-                return extractTextFromPdf(filePath);
-            }
-            return extractTextWithTika(filePath);
-        } catch (Exception e) {
-            log.warn("Text extraction failed for {}: {}", filePath, e.getMessage());
-            return null;
-        }
-    }
-
-    private String extractTextFromPdf(Path pdfPath) throws Exception {
+    private List<byte[]> rasterizePdfPages(Path pdfPath) throws Exception {
+        List<byte[]> images = new ArrayList<>();
         try (var document = org.apache.pdfbox.Loader.loadPDF(pdfPath.toFile())) {
-            var stripper = new org.apache.pdfbox.text.PDFTextStripper();
-            String text = stripper.getText(document);
-            return text != null ? text.trim() : null;
+            PDFRenderer renderer = new PDFRenderer(document);
+            int pageCount = document.getNumberOfPages();
+            for (int i = 0; i < pageCount; i++) {
+                BufferedImage image = renderer.renderImageWithDPI(i, OCR_RENDER_DPI);
+                images.add(encodeAsJpeg(image));
+            }
         }
+        return images;
     }
 
-    private String extractTextWithTika(Path filePath) throws Exception {
-        try (InputStream is = new FileInputStream(filePath.toFile())) {
-            String text = TIKA.parseToString(is);
-            return text != null ? text.trim() : null;
-        }
+    private byte[] encodeAsJpeg(BufferedImage image) throws Exception {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ImageIO.write(image, "jpg", baos);
+        return baos.toByteArray();
+    }
+
+    private byte[] reencodeAsJpeg(byte[] originalBytes) throws Exception {
+        BufferedImage image = ImageIO.read(new java.io.ByteArrayInputStream(originalBytes));
+        if (image == null) return originalBytes; // already a supported format Groq can read directly
+        return encodeAsJpeg(image);
     }
 
     @SuppressWarnings("unchecked")

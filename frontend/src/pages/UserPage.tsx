@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { api, Bank } from '../api/client';
+import { api, Bank, MySession } from '../api/client';
 
 const POLL_INTERVAL_MS = 1500;
 const ACTIVE_STATUSES = ['PENDING', 'NEEDS_MORE_DOCUMENTS'];
@@ -11,6 +11,8 @@ export default function UserPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+
+  const [recentSessions, setRecentSessions] = useState<MySession[]>([]);
 
   // Session state
   const [sessionId, setSessionId] = useState<number | null>(null);
@@ -25,6 +27,7 @@ export default function UserPage() {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadLabel, setUploadLabel] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [downloadingPdf, setDownloadingPdf] = useState(false);
 
   const pollRef = useRef<ReturnType<typeof setInterval>>();
 
@@ -40,9 +43,19 @@ export default function UserPage() {
     }
   }, []);
 
+  const loadRecentSessions = useCallback(async () => {
+    try {
+      const sessions = await api.getMySessions();
+      setRecentSessions(sessions.slice(0, 5));
+    } catch {
+      setRecentSessions([]);
+    }
+  }, []);
+
   useEffect(() => {
     loadBanks();
-  }, [loadBanks]);
+    loadRecentSessions();
+  }, [loadBanks, loadRecentSessions]);
 
   // Poll session status while a run is in progress
   useEffect(() => {
@@ -56,29 +69,19 @@ export default function UserPage() {
           if (status.thinkingSteps && Array.isArray(status.thinkingSteps)) {
             setThinkingSteps(status.thinkingSteps);
           }
-
-          if (status.documents) {
-            setDocuments(status.documents);
-          }
-
-          if (status.report) {
-            setReport(status.report);
-          }
-
-          if (Array.isArray(status.missingDocuments)) {
-            setMissingDocuments(status.missingDocuments);
-          }
+          if (status.documents) setDocuments(status.documents);
+          if (status.report) setReport(status.report);
+          if (Array.isArray(status.missingDocuments)) setMissingDocuments(status.missingDocuments);
 
           if (status.status === 'DONE' || status.status === 'NEEDS_MORE_DOCUMENTS') {
             if (pollRef.current) clearInterval(pollRef.current);
+            if (status.status === 'DONE') loadRecentSessions();
           }
-
           if (status.status === 'FAILED') {
             setError(status.errorMessage || 'Verification failed');
             if (pollRef.current) clearInterval(pollRef.current);
           }
         } catch (e: any) {
-          // Don't set error for transient poll failures
           console.warn('Poll failed:', e.message);
         }
       }, POLL_INTERVAL_MS);
@@ -87,7 +90,7 @@ export default function UserPage() {
         if (pollRef.current) clearInterval(pollRef.current);
       };
     }
-  }, [sessionId]);
+  }, [sessionId, loadRecentSessions]);
 
   const handleStartSession = async () => {
     if (!selectedBankId) {
@@ -122,7 +125,6 @@ export default function UserPage() {
       setSuccess(`"${label}" added`);
       setUploadFile(null);
       setUploadLabel('');
-      // Refresh document list
       const status = await api.getVerificationStatus(sessionId);
       if (status.documents) setDocuments(status.documents);
     } catch (e: any) {
@@ -134,18 +136,42 @@ export default function UserPage() {
 
   const handleRunVerification = async () => {
     if (!sessionId) return;
+    const previousStatus = sessionStatus;
+    setError('');
+    setSuccess('');
+    setThinkingSteps(['Starting analysis...']);
+    setReport(null);
+    setMissingDocuments([]);
+    // Show the loading screen immediately on click rather than waiting on the network
+    // round-trip — the poll corrects this to the real status moments later regardless.
+    setSessionStatus('EXTRACTING');
+    setCurrentPhase('Extracting text from your documents...');
     try {
-      setError('');
-      setSuccess('');
-      setThinkingSteps([]);
-      setReport(null);
-      setMissingDocuments([]);
-      setThinkingSteps(['📄 Starting verification...']);
       await api.runVerification(sessionId);
-      setSessionStatus('VERIFYING');
-      setCurrentPhase('Processing documents...');
+    } catch (e: any) {
+      setSessionStatus(previousStatus);
+      setError(e.message);
+    }
+  };
+
+  const handleDownloadPdf = async () => {
+    if (!sessionId) return;
+    setDownloadingPdf(true);
+    setError('');
+    try {
+      const blob = await api.downloadOpinionPdf(sessionId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `legal-opinion-${sessionId}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
     } catch (e: any) {
       setError(e.message);
+    } finally {
+      setDownloadingPdf(false);
     }
   };
 
@@ -164,139 +190,145 @@ export default function UserPage() {
     if (pollRef.current) clearInterval(pollRef.current);
   };
 
-  const getStatusBadge = (status: string) => {
-    const cls =
-      status === 'DONE' ? 'badge-done'
-        : status === 'FAILED' ? 'badge-failed'
-        : status === 'NEEDS_MORE_DOCUMENTS' ? 'badge-pending'
-        : RUNNING_STATUSES.includes(status) ? 'badge-processing'
-        : 'badge-pending';
-    return <span className={`badge ${cls}`}>{status.replace(/_/g, ' ')}</span>;
+  const getVerdictBannerClass = (verdict: string) => {
+    if (verdict === 'PASS') return 'verdict-banner pass';
+    if (verdict === 'FAIL' || verdict === 'ERROR') return 'verdict-banner fail';
+    return 'verdict-banner incomplete';
   };
 
-  const getVerdictBadge = (verdict: string) => {
-    const cls = verdict === 'PASS' ? 'badge-done'
-      : verdict === 'FAIL' || verdict === 'ERROR' ? 'badge-failed'
-      : 'badge-pending';
-    const label = verdict === 'PASS' ? '✅ Legally Valid (Pass)'
-      : verdict === 'FAIL' ? '❌ Fail'
-      : verdict === 'INCOMPLETE' ? '📎 Incomplete — documents needed'
-      : verdict === 'ERROR' ? '⚠️ Error'
-      : verdict;
-    return <span className={`badge ${cls}`}>{label}</span>;
+  const getVerdictLabel = (verdict: string) => {
+    if (verdict === 'PASS') return 'Legally Valid — Verdict: Pass';
+    if (verdict === 'FAIL') return 'Verdict: Fail — Defects Found';
+    if (verdict === 'INCOMPLETE') return 'Verdict: Incomplete — Documents Pending';
+    if (verdict === 'ERROR') return 'Verdict: Analysis Error';
+    return `Verdict: ${verdict}`;
   };
 
   const isUploadStage = sessionId && ACTIVE_STATUSES.includes(sessionStatus);
   const isRunning = RUNNING_STATUSES.includes(sessionStatus);
 
+  // Stepper phase: 1 = select bank, 2 = upload/run, 3 = opinion ready
+  const stepPhase = !sessionId ? 1 : (sessionStatus === 'DONE' ? 3 : 2);
+
   return (
     <div>
       <div className="page-header">
-        <h1>Legal Document Verification</h1>
-        <p>Upload documents for a bank and get a legal verification report — if a referenced document is missing, you'll be asked to add it.</p>
+        <h1>Submit for Legal Opinion</h1>
+        <p>Upload your legal documents and receive a structured legal opinion — in the bank's own format when one has been configured, or our standard format otherwise.</p>
+      </div>
+
+      <div className="stepper">
+        <div className={`stepper-step ${stepPhase === 1 ? 'active' : 'done'}`}>
+          <span className="stepper-dot">{stepPhase > 1 ? '✓' : '1'}</span>
+          <span className="stepper-label">Select Bank</span>
+        </div>
+        <div className="stepper-line" />
+        <div className={`stepper-step ${stepPhase === 2 ? 'active' : stepPhase > 2 ? 'done' : ''}`}>
+          <span className="stepper-dot">{stepPhase > 2 ? '✓' : '2'}</span>
+          <span className="stepper-label">Upload Documents</span>
+        </div>
+        <div className="stepper-line" />
+        <div className={`stepper-step ${stepPhase === 3 ? 'active' : ''}`}>
+          <span className="stepper-dot">3</span>
+          <span className="stepper-label">Legal Opinion</span>
+        </div>
       </div>
 
       {error && <div className="alert alert-error">{error}</div>}
       {success && <div className="alert alert-success">{success}</div>}
 
-      {/* Bank Selection (before session starts) */}
+      {/* Bank Selection */}
       {!sessionId && (
-        <div className="card" style={{ marginBottom: '1.5rem' }}>
-          <div className="form-group">
-            <label htmlFor="bank-select">Select Bank</label>
-            {loading ? (
-              <div style={{ padding: '0.5rem 0' }}><span className="spinner" /> Loading banks...</div>
-            ) : banks.length === 0 ? (
-              <p style={{ color: 'var(--gray-500)', fontSize: '0.875rem' }}>
-                No banks configured yet. Ask an admin to set up a bank first.
-              </p>
-            ) : (
-              <select
-                id="bank-select"
-                className="form-select"
-                value={selectedBankId}
-                onChange={e => setSelectedBankId(e.target.value ? Number(e.target.value) : '')}
-              >
-                <option value="">— Select a bank —</option>
-                {banks.map(bank => (
-                  <option key={bank.id} value={bank.id}>{bank.name}</option>
-                ))}
-              </select>
-            )}
+        <>
+          <div className="card" style={{ marginBottom: '1.5rem' }}>
+            <div className="form-group">
+              <label htmlFor="bank-select">Select Bank</label>
+              {loading ? (
+                <div style={{ padding: '0.5rem 0' }}><span className="spinner" /> Loading banks...</div>
+              ) : banks.length === 0 ? (
+                <p className="form-hint">No banks configured yet. Ask an admin to set up a bank first.</p>
+              ) : (
+                <select
+                  id="bank-select"
+                  className="form-select"
+                  value={selectedBankId}
+                  onChange={e => setSelectedBankId(e.target.value ? Number(e.target.value) : '')}
+                >
+                  <option value="">— Select a bank —</option>
+                  {banks.map(bank => (
+                    <option key={bank.id} value={bank.id}>{bank.name}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            <button className="btn btn-primary btn-block" onClick={handleStartSession} disabled={!selectedBankId || loading}>
+              Begin Submission
+            </button>
           </div>
 
-          <button
-            className="btn btn-primary"
-            onClick={handleStartSession}
-            disabled={!selectedBankId || loading}
-            style={{ width: '100%', justifyContent: 'center' }}
-          >
-            Start Verification
-          </button>
-        </div>
+          {recentSessions.length > 0 && (
+            <div className="card">
+              <label style={{ fontWeight: 700, fontSize: '0.8125rem', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--ink-muted)', marginBottom: '0.75rem', display: 'block' }}>
+                Recent Submissions
+              </label>
+              <div className="dossier" style={{ border: 'none' }}>
+                {recentSessions.map(s => (
+                  <div key={s.id} className="dossier-item" style={{ border: '1px solid var(--rule)', borderRadius: 'var(--radius)', marginBottom: '0.5rem' }}>
+                    <span className="doc-name">{s.bankName || `Bank #${s.bankId}`}</span>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--ink-faint)' }}>
+                      {s.createdAt ? new Date(s.createdAt).toLocaleDateString() : ''}
+                    </span>
+                    <span className={`badge ${s.status === 'DONE' ? 'badge-done' : s.status === 'FAILED' ? 'badge-failed' : 'badge-pending'}`}>
+                      {s.verdict || s.status.replace(/_/g, ' ')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
-      {/* Upload stage: initial upload (PENDING) or supplying a missing referenced document (NEEDS_MORE_DOCUMENTS) */}
+      {/* Upload stage */}
       {isUploadStage && (
         <div className="card" style={{ marginBottom: '1.5rem' }}>
           {sessionStatus === 'NEEDS_MORE_DOCUMENTS' && missingDocuments.length > 0 && (
-            <div style={{
-              padding: '1rem', borderRadius: 'var(--radius)',
-              background: '#fffbeb', border: '1px solid #fde68a', marginBottom: '1.5rem'
-            }}>
-              <p style={{ fontWeight: 600, fontSize: '0.9375rem', marginBottom: '0.5rem', color: '#92400e' }}>
-                📎 {missingDocuments.length} more document{missingDocuments.length > 1 ? 's are' : ' is'} needed to complete verification
+            <div className="missing-doc-notice">
+              <p className="missing-doc-title">
+                {missingDocuments.length} more document{missingDocuments.length > 1 ? 's are' : ' is'} needed to complete your opinion
               </p>
               {missingDocuments.map((md: any, i: number) => (
-                <div key={i} style={{ marginBottom: '0.625rem', fontSize: '0.875rem', color: '#78350f' }}>
+                <div key={i} className="missing-doc-entry">
                   <div style={{ fontWeight: 600 }}>{md.description || `Missing document ${i + 1}`}</div>
                   {md.reason && <div>{md.reason}</div>}
-                  {md.referencedIn && (
-                    <div style={{ fontSize: '0.8125rem', color: '#92400e' }}>Referenced in: {md.referencedIn}</div>
-                  )}
+                  {md.referencedIn && <div style={{ fontSize: '0.8125rem' }}>Referenced in: {md.referencedIn}</div>}
                 </div>
               ))}
-              <p style={{ fontSize: '0.8125rem', color: '#92400e' }}>
-                Upload the document(s) above, then click "Continue Verification" below.
+              <p style={{ fontSize: '0.8125rem', color: 'var(--warning)' }}>
+                Upload the document(s) above, then click "Continue".
               </p>
             </div>
           )}
 
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Upload Documents</h2>
+            <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.125rem' }}>Case Documents</h2>
             <span className="badge badge-processing">{documents.length} document(s)</span>
           </div>
 
-          {/* Document List */}
           {documents.length > 0 && (
-            <div style={{ marginBottom: '1rem' }}>
+            <div className="dossier">
               {documents.map((doc: any, i: number) => (
-                <div
-                  key={i}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: '0.5rem',
-                    padding: '0.5rem 0.75rem', background: 'var(--gray-50)',
-                    borderRadius: 'var(--radius)', border: '1px solid var(--gray-200)',
-                    marginBottom: '0.375rem'
-                  }}
-                >
-                  <span style={{ color: 'var(--gray-400)', fontWeight: 600, fontSize: '0.8125rem' }}>#{i + 1}</span>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--gray-500)"
-                       strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                    <polyline points="14 2 14 8 20 8"/>
-                  </svg>
-                  <span style={{ fontWeight: 500, fontSize: '0.875rem', flex: 1 }}>
-                    {doc.label || doc.fileName}
-                  </span>
-                  <span className="badge badge-done" style={{ fontSize: '0.6875rem' }}>{doc.fileType}</span>
+                <div key={i} className="dossier-item">
+                  <span className="doc-index">{String(i + 1).padStart(2, '0')}</span>
+                  <span className="doc-name">{doc.label || doc.fileName}</span>
+                  <span className="badge badge-done">{doc.fileType}</span>
                 </div>
               ))}
             </div>
           )}
 
-          {/* Upload Form */}
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-end', marginBottom: '1rem' }}>
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-end', marginBottom: '1.25rem' }}>
             <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
               <input
                 className="form-input"
@@ -306,8 +338,8 @@ export default function UserPage() {
               />
             </div>
             <div
-              className="file-upload-area"
-              style={{ padding: '0.625rem 1rem', cursor: 'pointer', flexShrink: 0 }}
+              className={`file-upload-area ${uploadFile ? 'has-file' : ''}`}
+              style={{ padding: '0.65rem 1rem', cursor: 'pointer', flexShrink: 0 }}
               onClick={() => document.getElementById('verify-file-input')?.click()}
             >
               <input
@@ -317,38 +349,23 @@ export default function UserPage() {
                 onChange={e => setUploadFile(e.target.files?.[0] || null)}
               />
               {uploadFile ? (
-                <span style={{ fontWeight: 500, fontSize: '0.8125rem', color: 'var(--success)' }}>
-                  ✓ {uploadFile.name}
-                </span>
+                <span style={{ fontWeight: 600, fontSize: '0.8125rem', color: 'var(--success)' }}>✓ {uploadFile.name}</span>
               ) : (
-                <span style={{ fontSize: '0.8125rem', color: 'var(--gray-500)' }}>Browse...</span>
+                <span style={{ fontSize: '0.8125rem', color: 'var(--ink-muted)' }}>Browse... (up to 30MB)</span>
               )}
             </div>
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={handleAddDocument}
-              disabled={!uploadFile || uploading}
-            >
+            <button className="btn btn-primary btn-sm" onClick={handleAddDocument} disabled={!uploadFile || uploading}>
               {uploading ? <><span className="spinner" /> Adding...</> : 'Add'}
             </button>
           </div>
 
-          {/* Run / Continue Verification Button */}
           {documents.length >= 1 && (
-            <button
-              className="btn btn-primary"
-              onClick={handleRunVerification}
-              style={{ width: '100%', justifyContent: 'center' }}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                   strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polygon points="5 3 19 12 5 21 5 3"/>
-              </svg>
-              {sessionStatus === 'NEEDS_MORE_DOCUMENTS' ? 'Continue Verification' : 'Run Verification'} ({documents.length} document{documents.length > 1 ? 's' : ''})
+            <button className="btn btn-primary btn-block" onClick={handleRunVerification}>
+              {sessionStatus === 'NEEDS_MORE_DOCUMENTS' ? 'Continue to Legal Opinion' : 'Submit for Legal Opinion'} ({documents.length} document{documents.length > 1 ? 's' : ''})
             </button>
           )}
 
-          <button className="btn btn-secondary btn-sm" style={{ marginTop: '0.75rem' }} onClick={handleReset}>
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: '0.75rem' }} onClick={handleReset}>
             ← Cancel & go back
           </button>
         </div>
@@ -357,139 +374,116 @@ export default function UserPage() {
       {/* Running verification */}
       {isRunning && (
         <div className="card" style={{ marginBottom: '1.5rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Verification in Progress</h2>
-            {getStatusBadge(sessionStatus)}
-          </div>
+          <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.125rem', marginBottom: '1rem' }}>Preparing Your Legal Opinion</h2>
 
           {currentPhase && (
             <div style={{
               padding: '0.75rem 1rem', borderRadius: 'var(--radius)',
-              background: 'var(--primary-light)', border: '1px solid var(--primary)30',
-              marginBottom: '1rem', fontWeight: 500, fontSize: '0.9375rem',
-              color: 'var(--primary)', display: 'flex', alignItems: 'center', gap: '0.5rem'
+              background: 'var(--accent-light)', marginBottom: '1.25rem',
+              fontWeight: 600, fontSize: '0.9375rem', color: 'var(--accent)',
+              display: 'flex', alignItems: 'center', gap: '0.5rem'
             }}>
-              <span className="spinner" style={{ width: '1.25rem', height: '1.25rem', flexShrink: 0 }} />
+              <span className="spinner" style={{ width: '1.1rem', height: '1.1rem', flexShrink: 0 }} />
               {currentPhase}
             </div>
           )}
 
           {thinkingSteps.length > 0 && (
-            <div>
-              <label style={{ fontWeight: 600, fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.5rem', display: 'block' }}>
-                AI Thinking Log
-              </label>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.375rem' }}>
-                {thinkingSteps.map((step, i) => (
+            <div className="margin-log">
+              {thinkingSteps.map((step, i) => {
+                const isAi = step.startsWith('🤖');
+                const isWarn = step.startsWith('⚠️') || step.startsWith('📎');
+                return (
                   <div
                     key={i}
-                    style={{
-                      padding: '0.5rem 0.75rem', borderRadius: 'var(--radius)',
-                      background: step.startsWith('🤖') ? '#f0fdf4' : step.startsWith('⚠️') ? '#fffbeb' : 'var(--gray-50)',
-                      border: '1px solid var(--gray-200)',
-                      fontSize: '0.8125rem', color: 'var(--gray-700)',
-                      animation: i === thinkingSteps.length - 1 ? 'fadeIn 0.3s ease' : 'none',
-                      display: 'flex', alignItems: 'center', gap: '0.5rem'
-                    }}
+                    className={`margin-log-entry ${isAi ? 'ai' : isWarn ? 'warn' : ''}`}
+                    style={{ animation: i === thinkingSteps.length - 1 ? 'fadeIn 0.3s ease' : 'none' }}
                   >
-                    <span>{step}</span>
+                    {step}
                   </div>
-                ))}
-                <div style={{
-                  padding: '0.5rem 0.75rem', borderRadius: 'var(--radius)',
-                  background: 'var(--gray-50)', border: '1px solid var(--gray-200)',
-                  fontSize: '0.8125rem', color: 'var(--gray-500)', fontStyle: 'italic',
-                  display: 'flex', alignItems: 'center', gap: '0.5rem'
-                }}>
-                  <span className="spinner" style={{ width: '0.75rem', height: '0.75rem' }} />
-                  Processing...
-                </div>
+                );
+              })}
+              <div className="margin-log-entry" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span className="spinner" style={{ width: '0.7rem', height: '0.7rem' }} />
+                Processing...
               </div>
             </div>
           )}
 
-          <button className="btn btn-secondary btn-sm" style={{ marginTop: '1rem' }} onClick={handleReset}>
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: '1rem' }} onClick={handleReset}>
             ← Cancel
           </button>
         </div>
       )}
 
-      {/* Final report */}
-      {sessionStatus === 'DONE' && report && (
+      {/* Failed run */}
+      {sessionStatus === 'FAILED' && (
         <div className="card">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>{report.title || 'Legal Verification Report'}</h2>
-            {report.verdict && getVerdictBadge(report.verdict)}
+          <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.125rem', marginBottom: '1rem' }}>Analysis Could Not Complete</h2>
+          <div className="alert alert-error" style={{ marginBottom: '1.25rem' }}>
+            {error || 'Something went wrong while preparing your legal opinion.'}
           </div>
+          <p className="form-hint" style={{ marginBottom: '1.25rem' }}>
+            This is often caused by a document with no readable text (e.g. a low-quality scan). You can try
+            again, add another copy of the document, or start over.
+          </p>
+          <div style={{ display: 'flex', gap: '0.75rem' }}>
+            <button className="btn btn-primary" onClick={handleRunVerification}>Try Again</button>
+            <button className="btn btn-secondary" onClick={handleReset}>Start Over</button>
+          </div>
+        </div>
+      )}
+
+      {/* Final legal opinion */}
+      {sessionStatus === 'DONE' && report && (
+        <div className="opinion-letter">
+          <h2>{report.title || 'Legal Opinion'}</h2>
+          <p className="opinion-byline">Prepared by InstaLego · {new Date().toLocaleDateString()}</p>
+
+          {report.verdict && (
+            <div className={getVerdictBannerClass(report.verdict)}>{getVerdictLabel(report.verdict)}</div>
+          )}
 
           {report.overallVerdict && (
-            <div style={{
-              padding: '1rem', borderRadius: 'var(--radius)',
-              background: report.verdict === 'PASS' ? '#f0fdf4' : report.verdict === 'FAIL' ? '#fef2f2' : '#fffbeb',
-              border: `1px solid ${report.verdict === 'PASS' ? '#86efac' : report.verdict === 'FAIL' ? '#fecaca' : '#fde68a'}`,
-              marginBottom: '1.5rem'
-            }}>
-              <p style={{ fontWeight: 500, fontSize: '0.9375rem', lineHeight: 1.6 }}>{report.overallVerdict}</p>
+            <div className="opinion-section">
+              <label>Overall Assessment</label>
+              <p style={{ fontSize: '0.9375rem', lineHeight: 1.7 }}>{report.overallVerdict}</p>
             </div>
           )}
 
           {report.documentsAnalyzed && report.documentsAnalyzed.length > 0 && (
-            <div style={{ marginBottom: '1.5rem' }}>
-              <label style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.75rem', display: 'block' }}>
-                Document Analysis ({report.documentsAnalyzed.length})
-              </label>
+            <div className="opinion-section">
+              <label>Document-by-Document Analysis ({report.documentsAnalyzed.length})</label>
               {report.documentsAnalyzed.map((doc: any, i: number) => (
-                <div key={i} style={{
-                  padding: '0.75rem', borderRadius: 'var(--radius)',
-                  border: '1px solid var(--gray-200)', marginBottom: '0.625rem',
-                  background: 'var(--gray-50)'
-                }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                    <span style={{ fontWeight: 600, fontSize: '0.875rem' }}>{doc.name || doc.type || `Document ${i + 1}`}</span>
+                <div key={i} className="doc-analysis-card">
+                  <div className="doc-analysis-head">
+                    <span className="doc-analysis-title">{doc.name || doc.type || `Document ${i + 1}`}</span>
                     <span className={`badge ${
                       doc.status === 'VALID' ? 'badge-done'
                         : doc.status === 'MINOR_ISSUES' ? 'badge-pending'
                         : doc.status === 'INVALID' ? 'badge-failed'
                         : 'badge-pending'
-                    }`} style={{ fontSize: '0.6875rem' }}>
+                    }`}>
                       {doc.status || 'ANALYZED'}
                     </span>
                   </div>
 
                   {doc.keyDetails && (
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.375rem', marginBottom: '0.5rem', fontSize: '0.8125rem' }}>
-                      {doc.keyDetails.date && (
-                        <div><span style={{ color: 'var(--gray-500)' }}>Date:</span> {doc.keyDetails.date}</div>
-                      )}
-                      {doc.keyDetails.parties && doc.keyDetails.parties.length > 0 && (
-                        <div><span style={{ color: 'var(--gray-500)' }}>Parties:</span> {doc.keyDetails.parties.join(', ')}</div>
-                      )}
-                      {doc.keyDetails.referenceNumbers && doc.keyDetails.referenceNumbers.length > 0 && (
-                        <div><span style={{ color: 'var(--gray-500)' }}>Ref #:</span> {doc.keyDetails.referenceNumbers.join(', ')}</div>
-                      )}
-                      {doc.keyDetails.amounts && doc.keyDetails.amounts.length > 0 && (
-                        <div><span style={{ color: 'var(--gray-500)' }}>Amounts:</span> {doc.keyDetails.amounts.join(', ')}</div>
-                      )}
+                    <div className="doc-details">
+                      {doc.keyDetails.date && <div><strong>Date:</strong> {doc.keyDetails.date}</div>}
+                      {doc.keyDetails.parties?.length > 0 && <div><strong>Parties:</strong> {doc.keyDetails.parties.join(', ')}</div>}
+                      {doc.keyDetails.referenceNumbers?.length > 0 && <div><strong>Ref #:</strong> {doc.keyDetails.referenceNumbers.join(', ')}</div>}
+                      {doc.keyDetails.amounts?.length > 0 && <div><strong>Amounts:</strong> {doc.keyDetails.amounts.join(', ')}</div>}
                     </div>
                   )}
 
-                  {doc.findings && doc.findings.length > 0 && (
-                    <div style={{ marginBottom: '0.375rem' }}>
-                      {doc.findings.map((f: string, fi: number) => (
-                        <p key={fi} style={{ fontSize: '0.8125rem', color: 'var(--gray-600)', marginBottom: '0.125rem' }}>
-                          • {f}
-                        </p>
-                      ))}
-                    </div>
-                  )}
+                  {doc.findings?.map((f: string, fi: number) => (
+                    <p key={fi} className="doc-finding">• {f}</p>
+                  ))}
 
-                  {doc.issues && doc.issues.length > 0 && (
-                    <div style={{ padding: '0.5rem', borderRadius: 'var(--radius)', background: '#fef2f2', border: '1px solid #fecaca' }}>
-                      {doc.issues.map((issue: string, ii: number) => (
-                        <p key={ii} style={{ fontSize: '0.8125rem', color: '#991b1b', marginBottom: '0.125rem' }}>
-                          ⚠️ {issue}
-                        </p>
-                      ))}
+                  {doc.issues?.length > 0 && (
+                    <div className="doc-issues">
+                      {doc.issues.map((issue: string, ii: number) => <p key={ii}>⚠ {issue}</p>)}
                     </div>
                   )}
                 </div>
@@ -498,37 +492,22 @@ export default function UserPage() {
           )}
 
           {report.crossReferenceCheck && report.crossReferenceCheck.length > 0 && (
-            <div style={{ marginBottom: '1.5rem' }}>
-              <label style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.75rem', display: 'block' }}>
-                Cross-Reference Check
-              </label>
+            <div className="opinion-section">
+              <label>Cross-Reference Check</label>
               {report.crossReferenceCheck.map((cr: any, i: number) => {
-                const crColor = cr.status === 'MATCH' ? 'var(--success)'
-                  : cr.status === 'MISMATCH' ? 'var(--danger)'
-                  : 'var(--gray-500)';
+                const color = cr.status === 'MATCH' ? 'var(--success)' : cr.status === 'MISMATCH' ? 'var(--danger)' : 'var(--ink-muted)';
                 return (
-                  <div key={i} style={{
-                    padding: '0.75rem', borderRadius: 'var(--radius)',
-                    border: `1px solid ${crColor}30`, marginBottom: '0.5rem',
-                    background: `${crColor}05`
-                  }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
-                      <span style={{ fontWeight: 600, fontSize: '0.875rem' }}>
-                        {cr.documents ? cr.documents.join(' ↔ ') : 'Cross-reference'}
-                      </span>
-                      <span style={{
-                        fontSize: '0.75rem', fontWeight: 600, padding: '0.125rem 0.5rem',
-                        borderRadius: '9999px', background: `${crColor}15`, color: crColor
-                      }}>
-                        {cr.status || 'CHECKED'}
-                      </span>
+                  <div key={i} className="crossref-item" style={{ borderColor: color + '55' }}>
+                    <div className="crossref-head">
+                      <span className="crossref-title">{cr.documents ? cr.documents.join(' ↔ ') : 'Cross-reference'}</span>
+                      <span style={{ fontSize: '0.75rem', fontWeight: 700, color }}>{cr.status || 'CHECKED'}</span>
                     </div>
-                    <p style={{ fontSize: '0.8125rem', color: 'var(--gray-600)', marginBottom: '0.125rem' }}>
-                      <span style={{ fontWeight: 500 }}>Field:</span> {cr.field || cr.detail}
+                    <p style={{ fontSize: '0.8125rem', color: 'var(--ink-muted)' }}>
+                      <strong>{cr.field || cr.detail}</strong>
                     </p>
                     {cr.valueInDocA && cr.valueInDocB && (
-                      <div style={{ fontSize: '0.8125rem', color: 'var(--gray-500)' }}>
-                        <span>Doc A: {cr.valueInDocA} | Doc B: {cr.valueInDocB}</span>
+                      <div style={{ fontSize: '0.8125rem', color: 'var(--ink-faint)' }}>
+                        Doc A: {cr.valueInDocA} | Doc B: {cr.valueInDocB}
                       </div>
                     )}
                   </div>
@@ -538,23 +517,22 @@ export default function UserPage() {
           )}
 
           {report.recommendations && report.recommendations.length > 0 && (
-            <div style={{ marginBottom: '1.5rem' }}>
-              <label style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.5rem', display: 'block' }}>
-                Recommendations
-              </label>
+            <div className="opinion-section">
+              <label>Recommendations</label>
               <ul style={{ paddingLeft: '1.25rem' }}>
                 {report.recommendations.map((rec: string, i: number) => (
-                  <li key={i} style={{ fontSize: '0.875rem', color: 'var(--gray-700)', marginBottom: '0.25rem' }}>
-                    {rec}
-                  </li>
+                  <li key={i} style={{ fontSize: '0.9375rem', marginBottom: '0.3rem' }}>{rec}</li>
                 ))}
               </ul>
             </div>
           )}
 
-          <button className="btn btn-primary" onClick={handleReset}>
-            Verify Another Document
-          </button>
+          <div style={{ display: 'flex', gap: '0.75rem', marginTop: '2rem', paddingTop: '1.5rem', borderTop: '1px solid var(--rule)' }}>
+            <button className="btn btn-primary" onClick={handleDownloadPdf} disabled={downloadingPdf}>
+              {downloadingPdf ? <><span className="spinner" /> Preparing PDF...</> : 'Download Legal Opinion (PDF)'}
+            </button>
+            <button className="btn btn-secondary" onClick={handleReset}>Start a New Submission</button>
+          </div>
         </div>
       )}
     </div>

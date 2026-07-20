@@ -39,7 +39,6 @@ export default function AdminPage() {
     loadBanks();
   }, [loadBanks]);
 
-  // Load references and report format when viewing a bank
   useEffect(() => {
     if (viewingBank) {
       loadReferences(viewingBank.id);
@@ -93,7 +92,7 @@ export default function AdminPage() {
       setHasReportFormat(true);
       setStructureDerived(!!result.structureDerived);
       setReportFormatFile(null);
-      setSuccess(`Report format uploaded${result.structureDerived ? ' and structure derived' : ''}.`);
+      setSuccess(`Legal opinion format uploaded${result.structureDerived ? ' and structure derived' : ''}.`);
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -103,14 +102,14 @@ export default function AdminPage() {
 
   const handleDeleteReportFormat = async () => {
     if (!viewingBank) return;
-    if (!window.confirm(`Delete the report format for "${viewingBank.name}"? This cannot be undone.`)) return;
+    if (!window.confirm(`Delete the legal opinion format for "${viewingBank.name}"? This cannot be undone.`)) return;
     try {
       setError('');
       setSuccess('');
       await api.deleteReportFormat(viewingBank.id);
       setHasReportFormat(false);
       setStructureDerived(false);
-      setSuccess('Report format deleted.');
+      setSuccess('Legal opinion format deleted.');
     } catch (e: any) {
       setError(e.message);
     }
@@ -149,15 +148,14 @@ export default function AdminPage() {
     <div>
       <div className="page-header">
         <h1>Admin Panel</h1>
-        <p>Manage banks, report formats, and legal reference documents</p>
+        <p>Manage banks, their legal opinion formats, and reference documents used during verification.</p>
       </div>
 
       {error && <div className="alert alert-error">{error}</div>}
       {success && <div className="alert alert-success">{success}</div>}
 
-      {/* Add Bank Section */}
       <div className="card" style={{ marginBottom: '1.5rem' }}>
-        <h2 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>Add a Bank</h2>
+        <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.125rem', marginBottom: '0.9rem' }}>Add a Bank</h2>
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <input
             className="form-input"
@@ -172,17 +170,14 @@ export default function AdminPage() {
         </div>
       </div>
 
-      {/* Banks List */}
       <div className="card" style={{ marginBottom: '1.5rem' }}>
-        <h2 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>
+        <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.125rem', marginBottom: '0.9rem' }}>
           Banks ({banks.length})
         </h2>
         {loading ? (
           <div style={{ padding: '1rem 0' }}><span className="spinner" /> Loading...</div>
         ) : banks.length === 0 ? (
-          <p style={{ color: 'var(--gray-500)', fontSize: '0.875rem' }}>
-            No banks added yet. Create a bank above.
-          </p>
+          <p className="form-hint">No banks added yet. Create a bank above.</p>
         ) : (
           <div className="table-container">
             <table>
@@ -191,7 +186,6 @@ export default function AdminPage() {
                   <th>ID</th>
                   <th>Name</th>
                   <th>Created</th>
-                  <th>Report Format</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -199,29 +193,17 @@ export default function AdminPage() {
                 {banks.map(bank => (
                   <tr key={bank.id}>
                     <td>{bank.id}</td>
-                    <td style={{ fontWeight: 500 }}>{bank.name}</td>
-                    <td style={{ color: 'var(--gray-500)', fontSize: '0.8125rem' }}>
+                    <td style={{ fontWeight: 600 }}>{bank.name}</td>
+                    <td style={{ color: 'var(--ink-muted)', fontSize: '0.8125rem' }}>
                       {bank.createdAt ? new Date(bank.createdAt).toLocaleDateString() : '-'}
                     </td>
                     <td>
-                      {viewingBank?.id === bank.id && hasReportFormat ? (
-                        <span className="badge badge-done">Active</span>
-                      ) : viewingBank?.id === bank.id ? (
-                        <span className="badge badge-pending">Not set</span>
-                      ) : null}
-                    </td>
-                    <td>
-                      <div style={{ display: 'flex', gap: '0.375rem', flexWrap: 'wrap' }}>
-                        <button
-                          className="btn btn-secondary btn-sm"
-                          onClick={() => {
-                            setViewingBank(bank);
-                            setReportFormatFile(null);
-                          }}
-                        >
-                          View
-                        </button>
-                      </div>
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => { setViewingBank(bank); setReportFormatFile(null); }}
+                      >
+                        View
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -231,48 +213,38 @@ export default function AdminPage() {
         )}
       </div>
 
-      {/* View Bank Details */}
       {viewingBank && (
         <div className="card" style={{ marginBottom: '1.5rem' }}>
-          <h2 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>
+          <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.125rem', marginBottom: '0.9rem' }}>
             {viewingBank.name}
           </h2>
 
-          {/* Report Format Section */}
           <div style={{ marginBottom: '1.5rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem' }}>
-              <h3 style={{ fontSize: '0.9375rem', fontWeight: 600 }}>Verification Report Format</h3>
+              <h3 style={{ fontSize: '0.9375rem', fontWeight: 700 }}>Legal Opinion Format</h3>
               {hasReportFormat && (
-                <span className="badge badge-done" style={{ fontSize: '0.6875rem' }}>
-                  {structureDerived ? '✅ Structure derived' : '📄 Uploaded'}
-                </span>
+                <span className="badge badge-done">{structureDerived ? 'Structure derived' : 'Uploaded'}</span>
               )}
             </div>
 
-            <p style={{ fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.75rem' }}>
-              Upload a sample PDF showing how the verification report should look. The AI will analyze it and
-              format its output to match. If none is uploaded, the AI uses its own default format.
+            <p className="form-hint" style={{ marginBottom: '0.75rem' }}>
+              Upload a sample opinion PDF showing how this bank wants the output formatted. The open-source
+              model analyzes it and matches its structure. If none is uploaded, the standard InstaLego format is used.
             </p>
 
             {hasReportFormat ? (
-              <div style={{
-                padding: '0.75rem', borderRadius: 'var(--radius)',
-                background: '#f0fdf4', border: '1px solid #86efac',
-                marginBottom: '0.75rem'
-              }}>
-                <p style={{ fontSize: '0.875rem', color: '#065f46', marginBottom: '0.5rem' }}>
-                  ✓ Report format is configured for this bank.
-                </p>
+              <div className="alert alert-success" style={{ marginBottom: 0 }}>
+                <p style={{ marginBottom: '0.5rem' }}>This bank has a custom legal opinion format configured.</p>
                 <button className="btn btn-danger btn-sm" onClick={handleDeleteReportFormat}>
-                  Delete Report Format
+                  Delete Format
                 </button>
               </div>
             ) : (
-              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-end', marginBottom: '0.75rem' }}>
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-end' }}>
                 <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
                   <div
-                    className="file-upload-area"
-                    style={{ padding: '1rem', cursor: 'pointer' }}
+                    className={`file-upload-area ${reportFormatFile ? 'has-file' : ''}`}
+                    style={{ padding: '1rem' }}
                     onClick={() => document.getElementById('report-format-input')?.click()}
                   >
                     <input
@@ -282,42 +254,30 @@ export default function AdminPage() {
                       onChange={e => setReportFormatFile(e.target.files?.[0] || null)}
                     />
                     {reportFormatFile ? (
-                      <p style={{ fontWeight: 600, color: 'var(--success)', fontSize: '0.875rem' }}>
-                        ✓ {reportFormatFile.name}
-                      </p>
+                      <p style={{ fontWeight: 600, color: 'var(--success)', fontSize: '0.875rem' }}>✓ {reportFormatFile.name}</p>
                     ) : (
-                      <p style={{ color: 'var(--gray-500)', fontSize: '0.8125rem' }}>
-                        Click to select a sample report PDF
-                      </p>
+                      <p style={{ color: 'var(--ink-muted)', fontSize: '0.8125rem' }}>Click to select a sample opinion PDF</p>
                     )}
                   </div>
                 </div>
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={handleUploadReportFormat}
-                  disabled={!reportFormatFile || uploadingFormat}
-                >
+                <button className="btn btn-primary btn-sm" onClick={handleUploadReportFormat} disabled={!reportFormatFile || uploadingFormat}>
                   {uploadingFormat ? <><span className="spinner" /> Analyzing...</> : 'Upload & Analyze'}
                 </button>
               </div>
             )}
           </div>
 
-          {/* Legal References Section */}
-          <div style={{ borderTop: '1px solid var(--gray-200)', paddingTop: '1.5rem' }}>
-            <h2 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '0.75rem' }}>
-              Legal References
-            </h2>
-            <p style={{ fontSize: '0.8125rem', color: 'var(--gray-500)', marginBottom: '0.75rem' }}>
+          <div style={{ borderTop: '1px solid var(--rule)', paddingTop: '1.5rem' }}>
+            <h2 style={{ fontFamily: 'var(--font-serif)', fontSize: '1.0625rem', marginBottom: '0.75rem' }}>Legal References</h2>
+            <p className="form-hint" style={{ marginBottom: '0.75rem' }}>
               Upload bank policies, regulatory guidelines, or legal requirements for cross-referencing during verification.
             </p>
 
-            {/* Upload reference doc */}
             <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', alignItems: 'flex-end' }}>
               <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
                 <div
-                  className="file-upload-area"
-                  style={{ padding: '1rem', cursor: 'pointer' }}
+                  className={`file-upload-area ${refUploadFile ? 'has-file' : ''}`}
+                  style={{ padding: '1rem' }}
                   onClick={() => document.getElementById('ref-file-input')?.click()}
                 >
                   <input
@@ -327,61 +287,32 @@ export default function AdminPage() {
                     onChange={e => setRefUploadFile(e.target.files?.[0] || null)}
                   />
                   {refUploadFile ? (
-                    <p style={{ fontWeight: 600, color: 'var(--success)', fontSize: '0.875rem' }}>
-                      ✓ {refUploadFile.name}
-                    </p>
+                    <p style={{ fontWeight: 600, color: 'var(--success)', fontSize: '0.875rem' }}>✓ {refUploadFile.name}</p>
                   ) : (
-                    <p style={{ color: 'var(--gray-500)', fontSize: '0.8125rem' }}>
-                      Click to select PDF, DOCX, or TXT
-                    </p>
+                    <p style={{ color: 'var(--ink-muted)', fontSize: '0.8125rem' }}>Click to select PDF, DOCX, or TXT</p>
                   )}
                 </div>
               </div>
-              <button
-                className="btn btn-primary btn-sm"
-                onClick={handleUploadReference}
-                disabled={!refUploadFile || uploadingRef}
-              >
+              <button className="btn btn-primary btn-sm" onClick={handleUploadReference} disabled={!refUploadFile || uploadingRef}>
                 {uploadingRef ? <><span className="spinner" /> Uploading...</> : 'Upload Reference'}
               </button>
             </div>
 
-            {/* List of uploaded references */}
             {loadingRefs ? (
               <div style={{ padding: '0.75rem 0' }}><span className="spinner" /> Loading references...</div>
             ) : references.length === 0 ? (
-              <p style={{ color: 'var(--gray-500)', fontSize: '0.875rem', fontStyle: 'italic' }}>
-                No legal reference documents uploaded yet.
-              </p>
+              <p className="form-hint" style={{ fontStyle: 'italic' }}>No legal reference documents uploaded yet.</p>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <div className="dossier">
                 {references.map(ref => (
-                  <div
-                    key={ref.id}
-                    style={{
-                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                      padding: '0.625rem 0.75rem', background: 'var(--gray-50)',
-                      borderRadius: 'var(--radius)', border: '1px solid var(--gray-200)',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--gray-500)"
-                           strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                        <polyline points="14 2 14 8 20 8"/>
-                      </svg>
-                      <div>
-                        <p style={{ fontWeight: 500, fontSize: '0.875rem' }}>{ref.fileName}</p>
-                        <p style={{ fontSize: '0.75rem', color: 'var(--gray-400)' }}>
-                          {ref.fileType} — {ref.createdAt ? new Date(ref.createdAt).toLocaleDateString() : ''}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      className="btn btn-danger btn-sm"
-                      style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
-                      onClick={() => handleDeleteReference(ref)}
-                    >
+                  <div key={ref.id} className="dossier-item">
+                    <span className="doc-name">
+                      {ref.fileName}
+                      <span style={{ display: 'block', fontWeight: 400, fontSize: '0.75rem', color: 'var(--ink-faint)' }}>
+                        {ref.fileType} — {ref.createdAt ? new Date(ref.createdAt).toLocaleDateString() : ''}
+                      </span>
+                    </span>
+                    <button className="btn btn-danger btn-sm" onClick={() => handleDeleteReference(ref)}>
                       Delete
                     </button>
                   </div>
@@ -390,11 +321,7 @@ export default function AdminPage() {
             )}
           </div>
 
-          <button
-            className="btn btn-secondary btn-sm"
-            style={{ marginTop: '1rem' }}
-            onClick={() => setViewingBank(null)}
-          >
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: '1rem' }} onClick={() => setViewingBank(null)}>
             ← Back to bank list
           </button>
         </div>

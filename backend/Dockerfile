@@ -18,4 +18,8 @@ FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 EXPOSE 8080
-CMD ["java", "-Xmx256m", "-XX:+UseSerialGC", "-XX:+ExitOnOutOfMemoryError", "-XX:+HeapDumpOnOutOfMemoryError", "-XX:HeapDumpPath=/tmp/heapdump.hprof", "-jar", "app.jar", "--spring.profiles.active=prod"]
+# Heap is sized for Render's free-tier 512MB container (not the earlier 1024m default, which was
+# tuned for local dev) — 384m heap + a capped metaspace leaves headroom for thread stacks/JIT/OS
+# overhead. On a paid tier with more RAM, raise -Xmx accordingly for extra safety margin on very
+# large files.
+CMD ["java", "-Xmx384m", "-XX:MaxMetaspaceSize=96m", "-XX:+UseSerialGC", "-XX:+ExitOnOutOfMemoryError", "-XX:+HeapDumpOnOutOfMemoryError", "-XX:HeapDumpPath=/tmp/heapdump.hprof", "-jar", "app.jar", "--spring.profiles.active=prod"]

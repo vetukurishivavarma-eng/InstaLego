@@ -3,8 +3,6 @@ package com.instalego.service;
 import com.instalego.dto.BankRequest;
 import com.instalego.model.Bank;
 import com.instalego.repository.BankRepository;
-import com.instalego.repository.BankTemplateRepository;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,7 +12,6 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
@@ -24,9 +21,8 @@ import java.util.Map;
 public class BankService {
 
     private final BankRepository bankRepository;
-    private final BankTemplateRepository bankTemplateRepository;
-    private final GeminiService geminiService;
-    private final ObjectMapper objectMapper;
+    private final TextExtractionService textExtractionService;
+    private final GroqClient groqClient;
 
     @Value("${app.upload-dir}")
     private String uploadDir;
@@ -46,11 +42,13 @@ public class BankService {
         return bankRepository.findAll();
     }
 
+    /**
+     * Banks available for users to submit documents against. A bank-specific report format is
+     * optional — verification falls back to the default report structure when one isn't set —
+     * so every created bank is usable, not just ones with a custom format uploaded.
+     */
     public List<Bank> getBanksWithActiveTemplate() {
-        List<Bank> allBanks = bankRepository.findAll();
-        return allBanks.stream()
-                .filter(bank -> bankTemplateRepository.existsByBankId(bank.getId()))
-                .toList();
+        return bankRepository.findAll();
     }
 
     public Bank getBankById(Long id) {
@@ -59,8 +57,8 @@ public class BankService {
     }
 
     /**
-     * Upload a sample verification report PDF for a bank.
-     * Gemini analyzes it to derive the report structure.
+     * Upload a sample verification report PDF for a bank. Its structure is derived using the
+     * open-source Groq model so future verifications for this bank follow the same shape.
      */
     public Map<String, Object> uploadReportFormat(Long bankId, MultipartFile file) throws IOException {
         Bank bank = getBankById(bankId);
@@ -75,17 +73,20 @@ public class BankService {
         Path uploadPath = Path.of(uploadDir, "report-formats");
         Files.createDirectories(uploadPath);
         Path filePath = uploadPath.resolve(fileName);
-        file.transferTo(filePath.toFile());
+        // A relative File resolves against the servlet container's temp dir, not the app's
+        // working directory — always transfer to an absolute path.
+        file.transferTo(filePath.toAbsolutePath().toFile());
 
-        // Derive structure via Gemini
+        // Derive the report structure from the sample PDF's text using the open-source Groq model
         String structureDescription = null;
         try {
-            byte[] fileBytes = Files.readAllBytes(filePath);
-            String base64Data = Base64.getEncoder().encodeToString(fileBytes);
-            // Use Gemini to describe the report structure
-            var schema = geminiService.deriveSchemaFromTemplate(base64Data, "application/pdf");
-            structureDescription = objectMapper.writeValueAsString(schema);
-            log.info("Derived report structure for bank {}: {} fields", bankId, schema.size());
+            String sampleText = textExtractionService.extractText(filePath, "PDF");
+            if (sampleText != null && !sampleText.isBlank()) {
+                structureDescription = groqClient.deriveReportStructure(sampleText);
+                log.info("Derived report structure for bank {} ({} chars)", bankId, structureDescription.length());
+            } else {
+                log.warn("Sample report PDF for bank {} had no extractable text; using default structure", bankId);
+            }
         } catch (Exception e) {
             log.warn("Could not derive report structure from sample PDF for bank {}: {}", bankId, e.getMessage());
         }

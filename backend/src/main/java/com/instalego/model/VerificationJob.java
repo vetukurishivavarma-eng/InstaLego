@@ -24,6 +24,9 @@ public class VerificationJob {
     @Column(name = "bank_id", nullable = false)
     private Long bankId;
 
+    @Column(name = "user_id")
+    private Long userId;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, columnDefinition = "varchar(40)")
     private Status status = Status.PENDING;

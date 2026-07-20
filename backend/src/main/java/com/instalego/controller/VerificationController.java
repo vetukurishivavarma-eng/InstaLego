@@ -3,15 +3,21 @@ package com.instalego.controller;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.instalego.model.VerificationJob;
 import com.instalego.repository.VerificationJobRepository;
+import com.instalego.security.AuthenticatedUser;
+import com.instalego.service.BankService;
+import com.instalego.service.LegalOpinionPdfService;
 import com.instalego.service.VerificationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.security.core.Authentication;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -26,11 +32,15 @@ import java.util.*;
 @Slf4j
 public class VerificationController {
 
+    // FAILED is included so a user can retry (optionally after adding/replacing a document)
+    // without losing the documents they'd already uploaded to the session.
     private static final Set<VerificationJob.Status> UPLOADABLE_STATUSES = Set.of(
-            VerificationJob.Status.PENDING, VerificationJob.Status.NEEDS_MORE_DOCUMENTS);
+            VerificationJob.Status.PENDING, VerificationJob.Status.NEEDS_MORE_DOCUMENTS, VerificationJob.Status.FAILED);
 
     private final VerificationJobRepository jobRepository;
     private final VerificationService verificationService;
+    private final BankService bankService;
+    private final LegalOpinionPdfService legalOpinionPdfService;
     private final ObjectMapper objectMapper;
 
     @Autowired
@@ -44,16 +54,19 @@ public class VerificationController {
      * Step 1: Create a new verification session for a bank.
      */
     @PostMapping("/start")
-    public ResponseEntity<?> startSession(@RequestParam("bankId") Long bankId) {
+    public ResponseEntity<?> startSession(@RequestParam("bankId") Long bankId, Authentication authentication) {
         try {
+            AuthenticatedUser user = (AuthenticatedUser) authentication.getPrincipal();
+
             VerificationJob job = new VerificationJob();
             job.setBankId(bankId);
+            job.setUserId(user.id());
             job.setStatus(VerificationJob.Status.PENDING);
             job.setDocumentsJson("[]");
             job.setCurrentPhase("Ready to upload documents");
             VerificationJob saved = jobRepository.save(job);
 
-            log.info("Started verification session {} for bank {}", saved.getId(), bankId);
+            log.info("Started verification session {} for bank {} (user {})", saved.getId(), bankId, user.email());
 
             return ResponseEntity.ok(Map.of(
                     "id", saved.getId(),
@@ -77,7 +90,8 @@ public class VerificationController {
     public ResponseEntity<?> addDocument(
             @PathVariable Long sessionId,
             @RequestParam("file") MultipartFile file,
-            @RequestParam(value = "label", required = false) String label) {
+            @RequestParam(value = "label", required = false) String label,
+            Authentication authentication) {
         try {
             Optional<VerificationJob> optJob = jobRepository.findById(sessionId);
             if (optJob.isEmpty()) {
@@ -85,9 +99,16 @@ public class VerificationController {
             }
 
             VerificationJob job = optJob.get();
+            if (!canAccess(job, authentication)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Not your session"));
+            }
             if (!UPLOADABLE_STATUSES.contains(job.getStatus())) {
                 return ResponseEntity.badRequest().body(Map.of("error",
                         "Cannot add documents to a session that is already " + job.getStatus().name()));
+            }
+            if (file.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of("error",
+                        "The uploaded file is empty (0 bytes) — this can happen from a browser upload glitch. Please try selecting the file again."));
             }
 
             // Determine file type
@@ -101,7 +122,10 @@ public class VerificationController {
             Path uploadPath = Path.of(uploadDir, "verify", String.valueOf(sessionId));
             Files.createDirectories(uploadPath);
             Path filePath = uploadPath.resolve(fileName);
-            file.transferTo(filePath.toFile());
+            // MultipartFile.transferTo() resolves a *relative* File against the servlet
+            // container's internal temp dir, not the app's working directory — always pass an
+            // absolute path or uploads silently fail to find the (correctly-created) directory.
+            file.transferTo(filePath.toAbsolutePath().toFile());
 
             // Parse existing documents and add new one
             @SuppressWarnings("unchecked")
@@ -141,7 +165,7 @@ public class VerificationController {
      * run re-analyzes the full current set of uploaded documents from scratch.
      */
     @PostMapping("/{sessionId}/run")
-    public ResponseEntity<?> runVerification(@PathVariable Long sessionId) {
+    public ResponseEntity<?> runVerification(@PathVariable Long sessionId, Authentication authentication) {
         try {
             Optional<VerificationJob> optJob = jobRepository.findById(sessionId);
             if (optJob.isEmpty()) {
@@ -149,6 +173,9 @@ public class VerificationController {
             }
 
             VerificationJob job = optJob.get();
+            if (!canAccess(job, authentication)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Not your session"));
+            }
             if (!UPLOADABLE_STATUSES.contains(job.getStatus())) {
                 return ResponseEntity.badRequest().body(Map.of("error",
                         "Session is already " + job.getStatus().name()));
@@ -182,7 +209,7 @@ public class VerificationController {
      * final report.
      */
     @GetMapping("/{sessionId}")
-    public ResponseEntity<?> getStatus(@PathVariable Long sessionId) {
+    public ResponseEntity<?> getStatus(@PathVariable Long sessionId, Authentication authentication) {
         try {
             Optional<VerificationJob> optJob = jobRepository.findById(sessionId);
             if (optJob.isEmpty()) {
@@ -190,6 +217,9 @@ public class VerificationController {
             }
 
             VerificationJob job = optJob.get();
+            if (!canAccess(job, authentication)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Not your session"));
+            }
 
             Map<String, Object> response = new HashMap<>();
             response.put("id", job.getId());
@@ -253,6 +283,90 @@ public class VerificationController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(Map.of("error", e.getMessage()));
         }
+    }
+
+    /**
+     * Download the completed verification as a formatted "Legal Opinion" PDF.
+     */
+    @GetMapping("/{sessionId}/opinion.pdf")
+    public ResponseEntity<?> downloadOpinionPdf(@PathVariable Long sessionId, Authentication authentication) {
+        try {
+            Optional<VerificationJob> optJob = jobRepository.findById(sessionId);
+            if (optJob.isEmpty()) {
+                return ResponseEntity.notFound().build();
+            }
+
+            VerificationJob job = optJob.get();
+            if (!canAccess(job, authentication)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Not your session"));
+            }
+            if (job.getReportJson() == null || job.getReportJson().isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "No report available yet for this session"));
+            }
+
+            String bankName = null;
+            try {
+                bankName = bankService.getBankById(job.getBankId()).getName();
+            } catch (Exception ignored) {}
+
+            byte[] pdf = legalOpinionPdfService.generateOpinionPdf(job.getReportJson(), bankName, sessionId);
+
+            return ResponseEntity.ok()
+                    .contentType(MediaType.APPLICATION_PDF)
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"legal-opinion-" + sessionId + ".pdf\"")
+                    .body(pdf);
+        } catch (Exception e) {
+            log.error("Failed to generate opinion PDF for session {}", sessionId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "Failed to generate PDF: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * List the current user's past and in-progress verification sessions (most recent first) —
+     * a simple submission history now that sessions are tied to a logged-in account.
+     */
+    @GetMapping("/mine")
+    public ResponseEntity<?> getMine(Authentication authentication) {
+        AuthenticatedUser user = (AuthenticatedUser) authentication.getPrincipal();
+        List<VerificationJob> jobs = jobRepository.findByUserIdOrderByCreatedAtDesc(user.id());
+
+        List<Map<String, Object>> response = jobs.stream().map(job -> {
+            String bankName = "";
+            try {
+                bankName = bankService.getBankById(job.getBankId()).getName();
+            } catch (Exception ignored) {}
+
+            String verdict = null;
+            if (job.getReportJson() != null && !job.getReportJson().isBlank()) {
+                try {
+                    Map<?, ?> report = objectMapper.readValue(job.getReportJson(), Map.class);
+                    Object v = report.get("verdict");
+                    verdict = v != null ? v.toString() : null;
+                } catch (Exception ignored) {}
+            }
+
+            Map<String, Object> entry = new HashMap<>();
+            entry.put("id", job.getId());
+            entry.put("bankId", job.getBankId());
+            entry.put("bankName", bankName);
+            entry.put("status", job.getStatus().name());
+            entry.put("verdict", verdict);
+            entry.put("createdAt", job.getCreatedAt() != null ? job.getCreatedAt().toString() : null);
+            return entry;
+        }).toList();
+
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * A session belongs to whoever started it; ADMINs can also view any session. Sessions created
+     * before auth existed have a null userId — treated as accessible to avoid locking out
+     * pre-migration local dev data.
+     */
+    private boolean canAccess(VerificationJob job, Authentication authentication) {
+        AuthenticatedUser user = (AuthenticatedUser) authentication.getPrincipal();
+        if (job.getUserId() == null) return true;
+        return job.getUserId().equals(user.id()) || "ADMIN".equals(user.role());
     }
 
     /**

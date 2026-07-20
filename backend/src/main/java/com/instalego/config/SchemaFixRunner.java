@@ -30,8 +30,7 @@ public class SchemaFixRunner implements ApplicationRunner {
     private final DataSource dataSource;
 
     private static final String[] FIXES = {
-            "ALTER TABLE verification_jobs DROP CONSTRAINT IF EXISTS verification_jobs_status_check",
-            "ALTER TABLE conversion_jobs DROP CONSTRAINT IF EXISTS conversion_jobs_status_check"
+            "ALTER TABLE verification_jobs DROP CONSTRAINT IF EXISTS verification_jobs_status_check"
     };
 
     @Override

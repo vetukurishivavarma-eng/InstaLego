@@ -57,7 +57,7 @@ public class BankController {
 
     /**
      * Upload a sample verification report PDF for a bank.
-     * Gemini analyzes it and derives the expected report structure.
+     * The open-source Groq model analyzes it and derives the expected report structure.
      */
     @PostMapping("/{bankId}/report-format")
     public ResponseEntity<?> uploadReportFormat(

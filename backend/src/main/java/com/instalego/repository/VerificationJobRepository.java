@@ -9,4 +9,5 @@ import java.util.List;
 @Repository
 public interface VerificationJobRepository extends JpaRepository<VerificationJob, Long> {
     List<VerificationJob> findByBankIdOrderByCreatedAtDesc(Long bankId);
+    List<VerificationJob> findByUserIdOrderByCreatedAtDesc(Long userId);
 }
