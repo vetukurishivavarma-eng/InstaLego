@@ -202,7 +202,8 @@ public class GroqClient {
                 imageUrl.put("url", "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jpeg));
             }
 
-            requestBody.put("temperature", 0.1);
+            requestBody.put("temperature", 0.0);
+            requestBody.put("seed", 42); // best-effort determinism on top of temperature=0
             // Kept modest to fit within restrictive per-account TPM budgets on vision models (see
             // MAX_IMAGES_PER_REQUEST) — still enough for one page's transcription plus some
             // hidden reasoning overhead on models like Qwen.
@@ -303,8 +304,11 @@ public class GroqClient {
                 responseFormat.put("type", "json_object");
             }
 
-            // Generation config
-            requestBody.put("temperature", 0.1);
+            // Generation config — temperature 0 + a fixed seed maximizes run-to-run consistency
+            // for the same input (best-effort; inference stacks aren't always perfectly
+            // deterministic even at temp=0, but this minimizes it).
+            requestBody.put("temperature", 0.0);
+            requestBody.put("seed", 42);
             requestBody.put("max_tokens", 4096);
 
             String requestJson = objectMapper.writeValueAsString(requestBody);
