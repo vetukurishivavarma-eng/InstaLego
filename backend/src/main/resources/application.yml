@@ -49,15 +49,21 @@ spring:
     # sslmode=require is mandatory for managed Postgres providers like Neon; harmless elsewhere.
     # currentSchema keeps all of InstaLego's tables isolated in their own schema rather than the
     # database's default "public" schema — safe to share a database with other unrelated data.
-    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}?sslmode=require&currentSchema=${DB_SCHEMA:instalego}
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}?sslmode=require&currentSchema=instalego
     driver-class-name: org.postgresql.Driver
     username: ${DB_USERNAME:${DATABASE_USERNAME}}
     password: ${DB_PASSWORD:${DATABASE_PASSWORD}}
+  # Runs schema.sql (CREATE SCHEMA IF NOT EXISTS instalego) before Hibernate's ddl-auto=update —
+  # Postgres/Neon isn't an "embedded" database so this script doesn't run unless explicitly
+  # enabled. Without it, ddl-auto=update tries to create tables in a schema that doesn't exist yet.
+  sql:
+    init:
+      mode: always
   jpa:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
-        default_schema: ${DB_SCHEMA:instalego}
+        default_schema: instalego
   h2:
     console:
       enabled: false
