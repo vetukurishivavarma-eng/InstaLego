@@ -656,6 +656,8 @@ public class VerificationService {
         try {
             byte[] jpeg = reencodeAsJpeg(Files.readAllBytes(filePath));
             return groqClient.transcribeImages(List.of(jpeg));
+        } catch (GroqClient.QuotaExceededException e) {
+            throw e; // account-wide, won't recover for the rest of this run — fail the job now
         } catch (Exception e) {
             log.warn("Groq vision OCR fallback failed for {}: {}", filePath, e.getMessage());
             return null;
@@ -705,8 +707,8 @@ public class VerificationService {
             }
             thinkingSteps.add("🔎 Used open-source vision AI to read scanned/image content from \"" + label + "\"");
             return ocrText.toString();
-        } catch (IllegalStateException e) {
-            throw e; // page-limit — surface as a clear job failure rather than swallowing it
+        } catch (IllegalStateException | GroqClient.QuotaExceededException e) {
+            throw e; // page-limit or account-wide quota exhaustion — surface immediately, don't swallow
         } catch (Exception e) {
             log.warn("PDF processing failed for {}: {}", pdfPath, e.getMessage());
             return null;

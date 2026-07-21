@@ -154,6 +154,18 @@ public class GroqClient {
             java.util.regex.Pattern.compile("try again in ([0-9.]+)s", java.util.regex.Pattern.CASE_INSENSITIVE);
 
     /**
+     * Thrown when Groq rejects a request for exhausting a per-DAY quota (as opposed to a
+     * per-minute one) — retrying with backoff can never succeed until the quota resets roughly
+     * 24 hours later, so callers should fail the whole job immediately with this message rather
+     * than let every subsequent document silently retry and fail the same way.
+     */
+    public static class QuotaExceededException extends RuntimeException {
+        public QuotaExceededException(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * Groq's 429 responses include the exact wait time needed (e.g. "Please try again in
      * 1.1775s") — honor that instead of blind exponential backoff, since a fixed 1s/2s schedule
      * can either under-wait (still gets rejected) or over-wait relative to what's actually needed.
@@ -166,6 +178,28 @@ public class GroqClient {
             return (long) (seconds * 1000) + 300; // small buffer for latency/clock skew
         }
         return baseDelayMs * (long) Math.pow(2, attempt - 1);
+    }
+
+    /**
+     * A per-minute rate limit is worth retrying (it clears in seconds); a per-DAY quota is not —
+     * it won't recover before this request's retry budget runs out, so every retry just wastes
+     * time before failing anyway. Groq's error message names the window explicitly ("tokens per
+     * day (TPD)", "requests per day (RPD)"), which is what this checks for.
+     */
+    private boolean isDailyQuotaExceeded(String responseBody) {
+        String lower = responseBody.toLowerCase(Locale.ROOT);
+        return lower.contains("per day") || lower.contains("(tpd)") || lower.contains("(rpd)");
+    }
+
+    private String extractGroqErrorMessage(String responseBody) {
+        try {
+            JsonNode error = objectMapper.readTree(responseBody).get("error");
+            if (error != null && error.has("message")) {
+                return error.get("message").asText();
+            }
+        } catch (Exception ignored) {
+        }
+        return responseBody;
     }
 
     private String callGroqVision(List<byte[]> jpegBatch) {
@@ -239,6 +273,9 @@ public class GroqClient {
                             }
                         }
                         throw new RuntimeException("Unexpected Groq vision response structure: " + responseBody);
+                    } else if (statusCode == 429 && isDailyQuotaExceeded(responseBody)) {
+                        throw new QuotaExceededException("Daily AI usage quota exceeded for the vision/OCR model: "
+                                + extractGroqErrorMessage(responseBody));
                     } else if (statusCode == 429 && attempt < maxRetries) {
                         long delay = resolveRetryDelayMs(responseBody, attempt, baseDelayMs);
                         log.warn("Groq vision API rate limited (429), retrying in {}ms (attempt {}/{})", delay, attempt, maxRetries);
@@ -353,6 +390,8 @@ public class GroqClient {
                             }
                         }
                         throw new RuntimeException("Unexpected Groq response structure: " + responseBody);
+                    } else if (statusCode == 429 && isDailyQuotaExceeded(responseBody)) {
+                        throw new QuotaExceededException("Daily AI usage quota exceeded: " + extractGroqErrorMessage(responseBody));
                     } else if (statusCode == 429 && attempt < maxRetries) {
                         long delay = resolveRetryDelayMs(responseBody, attempt, baseDelayMs);
                         log.warn("Groq API rate limited (429), retrying in {}ms (attempt {}/{})", delay, attempt, maxRetries);
