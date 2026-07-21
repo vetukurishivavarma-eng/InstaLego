@@ -303,6 +303,11 @@ export default function UserPage() {
                   <div style={{ fontWeight: 600 }}>{md.description || `Missing document ${i + 1}`}</div>
                   {md.reason && <div>{md.reason}</div>}
                   {md.referencedIn && <div style={{ fontSize: '0.8125rem' }}>Referenced in: {md.referencedIn}</div>}
+                  {md.evidenceQuote && (
+                    <div style={{ fontSize: '0.75rem', fontStyle: 'italic', color: 'var(--ink-faint)', marginTop: '0.25rem' }}>
+                      "{md.evidenceQuote}"
+                    </div>
+                  )}
                 </div>
               ))}
               <p style={{ fontSize: '0.8125rem', color: 'var(--warning)' }}>

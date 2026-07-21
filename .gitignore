@@ -1,4 +1,5 @@
 # Java / Maven
+backend/.env.local
 backend/target/
 backend/*.zip
 backend/apache-maven-*/

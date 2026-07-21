@@ -30,6 +30,12 @@ public class VerificationService {
 
     private static final int OCR_RENDER_DPI = 150;
 
+    // A scanned PDF is rendered page-by-page and OCR'd one page at a time to bound peak memory
+    // (see extractPdfText below) — but an unreasonably long scan could still take a very long
+    // time / hit rate limits, so it's capped with a clear user-facing error rather than letting
+    // the container run indefinitely or exhaust memory on a pathological input.
+    private static final int MAX_OCR_PAGES = 60;
+
     // --- Context-window safety (map-reduce for large files) ---
     // gpt-oss-120b's context window is 131,072 tokens. These budgets stay well under that so a
     // 30MB file's extracted text can never overflow the window regardless of how large it is —
@@ -40,6 +46,17 @@ public class VerificationService {
     private static final int DOC_SLICE_CHARS = 90_000; // ~22.5k tokens, for one oversized document
 
     private record DocText(String label, String text) {}
+
+    /** Builds the single-prompt document block on demand — only needed for the (small) single-call path. */
+    private String joinDocTexts(List<DocText> docTexts) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < docTexts.size(); i++) {
+            DocText doc = docTexts.get(i);
+            sb.append("--- Document ").append(i + 1).append(": \"").append(doc.label()).append("\" ---\n");
+            sb.append(doc.text()).append("\n\n");
+        }
+        return sb.toString();
+    }
 
     /**
      * Default legal verification report structure used when a bank hasn't uploaded its own
@@ -81,10 +98,13 @@ public class VerificationService {
             // Parse documents JSON (the full current set — original + any added since)
             List<Map<String, Object>> documents = parseDocumentsJson(job.getDocumentsJson());
 
-            // Extract text from each document (sequential to minimize peak memory)
+            // Extract text from each document (sequential to minimize peak memory). Only docTexts
+            // is kept — the single-call path below joins it into one string on demand, rather than
+            // this loop separately accumulating a second full copy of every document's text that
+            // would otherwise sit in memory unused whenever the (large-file) chunked path is taken.
             List<String> thinkingSteps = new ArrayList<>();
-            StringBuilder allDocsText = new StringBuilder();
             List<DocText> docTexts = new ArrayList<>();
+            long totalChars = 0;
 
             for (int i = 0; i < documents.size(); i++) {
                 Map<String, Object> doc = documents.get(i);
@@ -95,23 +115,30 @@ public class VerificationService {
                 job.setCurrentPhase("Extracting: " + fileName + "...");
                 jobRepository.save(job);
 
-                String extractedText = textExtractionService.extractText(Path.of(filePath), fileType);
                 String label = (String) doc.getOrDefault("label", fileName);
+                String extractedText;
 
-                // If normal text extraction found nothing (typical for scanned/image-only PDFs
-                // or photos, which have no embedded text layer), fall back to Groq's vision model for OCR.
-                if ((extractedText == null || extractedText.isBlank()) && isOcrEligible(fileType)) {
-                    String ocrText = tryGroqVisionOcr(Path.of(filePath), fileType);
-                    if (ocrText != null && !ocrText.isBlank()) {
-                        extractedText = ocrText;
-                        thinkingSteps.add("🔎 Used open-source vision AI to read scanned/image content from \"" + label + "\"");
+                if ("PDF".equalsIgnoreCase(fileType)) {
+                    // Handles both the embedded-text case and the scanned/OCR fallback in one pass
+                    // (see extractPdfText) — the PDF is loaded into memory only once either way.
+                    extractedText = extractPdfText(Path.of(filePath), label, thinkingSteps);
+                } else {
+                    extractedText = textExtractionService.extractText(Path.of(filePath), fileType);
+
+                    // If normal text extraction found nothing (typical for image-only uploads, e.g.
+                    // a photo of a document), fall back to Groq's vision model for OCR.
+                    if ((extractedText == null || extractedText.isBlank()) && isOcrEligible(fileType)) {
+                        String ocrText = tryGroqVisionOcr(Path.of(filePath));
+                        if (ocrText != null && !ocrText.isBlank()) {
+                            extractedText = ocrText;
+                            thinkingSteps.add("🔎 Used open-source vision AI to read scanned/image content from \"" + label + "\"");
+                        }
                     }
                 }
 
                 if (extractedText != null && !extractedText.isBlank()) {
-                    allDocsText.append("--- Document ").append(i + 1).append(": \"").append(label).append("\" ---\n");
-                    allDocsText.append(extractedText).append("\n\n");
                     docTexts.add(new DocText(label, extractedText));
+                    totalChars += extractedText.length();
 
                     thinkingSteps.add("📄 Extracted text from \"" + label + "\" (" + extractedText.length() + " chars)");
                 } else {
@@ -119,7 +146,7 @@ public class VerificationService {
                 }
             }
 
-            if (allDocsText.isEmpty()) {
+            if (docTexts.isEmpty()) {
                 throw new IllegalStateException("Could not extract text from any uploaded document");
             }
 
@@ -134,10 +161,10 @@ public class VerificationService {
 
             // Under budget: one prompt with everything. Over budget: map-reduce so a large file
             // can never overflow the model's context window (see constants above).
-            int estimatedTokens = allDocsText.length() / CHARS_PER_TOKEN_ESTIMATE;
+            int estimatedTokens = (int) (totalChars / CHARS_PER_TOKEN_ESTIMATE);
             Map<String, Object> verificationResult;
             if (estimatedTokens <= SINGLE_CALL_TOKEN_BUDGET) {
-                verificationResult = callGroqForVerification(allDocsText.toString(), documents.size(), reportStructure);
+                verificationResult = callGroqForVerification(joinDocTexts(docTexts), documents.size(), reportStructure);
             } else {
                 thinkingSteps.add("📚 Large document set (~" + estimatedTokens + " tokens) — analyzing in batches to stay within model limits");
                 job.setThinkingSteps(toJson(thinkingSteps));
@@ -167,6 +194,11 @@ public class VerificationService {
             } else {
                 job.setStatus(VerificationJob.Status.DONE);
                 job.setCurrentPhase("✅ Verification complete — verdict: " + verdict);
+                // The report (already saved above) is all that's needed from here on — the
+                // session can't accept more uploads or re-runs once DONE, so the uploaded source
+                // files are no longer needed and are removed to keep disk usage from growing
+                // unbounded as more submissions accumulate over time.
+                deleteSessionFiles(documents);
             }
             jobRepository.save(job);
 
@@ -241,11 +273,18 @@ public class VerificationService {
                    to establish a complete, verifiable chain — e.g. a prior sale deed, gift deed, partition deed,
                    release deed, power of attorney, encumbrance certificate, NOC, mortgage release, court order,
                    or any document cited as the source of title, as a schedule reference, or as a supporting
-                   annexure.
+                   annexure. Only count something as "referenced" if you can quote the exact sentence or clause
+                   that names it — do NOT infer a document might exist just because it would be typical or
+                   prudent for this kind of transaction.
                 4. For each such referenced document, check whether it IS already included among the documents
                    provided (matching by document number, date, or description). If a referenced document is
                    NOT included, add it to "missingDocuments" with a clear, plain-language description of what
-                   to upload and why it's needed to complete verification.
+                   to upload, why it's needed to complete verification, and the exact quoted text from the
+                   source document that references it (field "evidenceQuote"). Be conservative: if you are not
+                   certain a specific document is referenced by name/number/date, do NOT add it to
+                   missingDocuments — an empty list is the correct output when nothing is clearly referenced
+                   but absent. Never add general/boilerplate suggestions (e.g. "an encumbrance certificate is
+                   usually recommended") as a missing document unless it is actually named in the text.
                 5. Cross-reference the documents that ARE provided against each other: do names, dates, amounts,
                    and reference numbers match consistently? Flag any MISMATCH.
                 6. Decide the verdict:
@@ -287,7 +326,8 @@ public class VerificationService {
                       {
                         "description": "e.g. Sale Deed dated 07-09-2016, Doc No. 5185/2016",
                         "reason": "Why this document is needed to complete the chain of title",
-                        "referencedIn": "Name of the document that references it"
+                        "referencedIn": "Name of the document that references it",
+                        "evidenceQuote": "Exact quoted sentence/clause from the source text naming this document"
                       }
                     ],
                     "crossReferenceCheck": [
@@ -418,7 +458,10 @@ public class VerificationService {
                    a complete chain of title (e.g. a prior sale deed, gift deed, partition deed, release
                    deed, power of attorney, encumbrance certificate, NOC, mortgage release, court order) —
                    as plain-language notes, one per reference, with enough detail (doc number/date/
-                   description) to match it later against the full document set.
+                   description) to match it later against the full document set. Only list something here
+                   if you can quote the exact sentence/clause that names it. Do NOT list a document type
+                   just because it would typically accompany this kind of transaction — if this excerpt
+                   doesn't explicitly name a specific other document, leave "referencedDocuments" empty.
 
                 Return JSON in this exact format:
                 {
@@ -483,8 +526,10 @@ public class VerificationService {
                 TASK:
                 1. For each candidate referenced document above, check whether it matches (by document
                    number, date, or description) one of the documents already analyzed. If NOT matched, add
-                   it to "missingDocuments" with a clear, plain-language description of what to upload and
-                   why it's needed.
+                   it to "missingDocuments" with a clear, plain-language description of what to upload, why
+                   it's needed, and the "evidenceQuote" text carried over from the candidate note. Be
+                   conservative: only include a candidate if it clearly names a specific, identifiable
+                   document — if the candidate list is empty or vague, "missingDocuments" should be empty.
                 2. Cross-reference the analyzed documents against each other: do names, dates, amounts, and
                    reference numbers match consistently? Flag any MISMATCH.
                 3. Decide the verdict:
@@ -505,7 +550,7 @@ public class VerificationService {
                   "report": {
                     "title": "Legal Verification Report",
                     "missingDocuments": [
-                      {"description": "...", "reason": "...", "referencedIn": "..."}
+                      {"description": "...", "reason": "...", "referencedIn": "...", "evidenceQuote": "..."}
                     ],
                     "crossReferenceCheck": [
                       {"documents": ["Doc A", "Doc B"], "field": "...", "valueInDocA": "...", "valueInDocB": "...", "status": "MATCH / MISMATCH / INFO", "detail": "..."}
@@ -573,6 +618,19 @@ public class VerificationService {
         }
     }
 
+    /** Best-effort cleanup of a completed session's uploaded files — never fails the job over it. */
+    private void deleteSessionFiles(List<Map<String, Object>> documents) {
+        for (Map<String, Object> doc : documents) {
+            String filePath = (String) doc.get("filePath");
+            if (filePath == null) continue;
+            try {
+                Files.deleteIfExists(Path.of(filePath));
+            } catch (Exception e) {
+                log.warn("Failed to delete uploaded file {} after job completion: {}", filePath, e.getMessage());
+            }
+        }
+    }
+
     private String getReportStructure(Long bankId) {
         try {
             Bank bank = bankService.getBankById(bankId);
@@ -586,42 +644,73 @@ public class VerificationService {
     }
 
     private boolean isOcrEligible(String fileType) {
-        String ext = fileType != null ? fileType.toUpperCase() : "";
-        return "PDF".equals(ext) || "IMAGE".equals(ext);
+        return "IMAGE".equals(fileType != null ? fileType.toUpperCase() : "");
     }
 
     /**
-     * Reads visible text from documents where PDFBox/Tika found no embedded text layer (e.g.
-     * scans or photos), using Groq's open-weight vision model. PDFs are rasterized page-by-page
-     * (Groq's vision endpoint takes images only) and sent in batches; plain image uploads go
-     * through as a single image.
+     * Reads visible text from a plain image upload (e.g. a photo of a document) using Groq's
+     * open-weight vision model. PDFs go through extractPdfText instead, which streams pages
+     * one at a time rather than loading a whole image list into memory up front.
      */
-    private String tryGroqVisionOcr(Path filePath, String fileType) {
+    private String tryGroqVisionOcr(Path filePath) {
         try {
-            List<byte[]> pageImages = "PDF".equalsIgnoreCase(fileType)
-                    ? rasterizePdfPages(filePath)
-                    : List.of(reencodeAsJpeg(Files.readAllBytes(filePath)));
-
-            if (pageImages.isEmpty()) return null;
-
-            return groqClient.transcribeImages(pageImages);
+            byte[] jpeg = reencodeAsJpeg(Files.readAllBytes(filePath));
+            return groqClient.transcribeImages(List.of(jpeg));
         } catch (Exception e) {
             log.warn("Groq vision OCR fallback failed for {}: {}", filePath, e.getMessage());
             return null;
         }
     }
 
-    private List<byte[]> rasterizePdfPages(Path pdfPath) throws Exception {
-        List<byte[]> images = new ArrayList<>();
+    /**
+     * Loads a PDF once and either returns its embedded text layer, or — if there isn't one (a
+     * scan) — OCRs it page by page via Groq's vision model, one page at a time: each page's
+     * rendered image is encoded, sent, and discarded before the next page is rendered, so peak
+     * memory stays roughly constant regardless of page count instead of scaling with it (the
+     * previous approach rasterized every page into a list before OCR-ing any of them, and
+     * separately re-loaded the whole PDF a second time after the text-extraction attempt above
+     * had already loaded it once).
+     */
+    private String extractPdfText(Path pdfPath, String label, List<String> thinkingSteps) {
         try (var document = org.apache.pdfbox.Loader.loadPDF(pdfPath.toFile())) {
-            PDFRenderer renderer = new PDFRenderer(document);
-            int pageCount = document.getNumberOfPages();
-            for (int i = 0; i < pageCount; i++) {
-                BufferedImage image = renderer.renderImageWithDPI(i, OCR_RENDER_DPI);
-                images.add(encodeAsJpeg(image));
+            var stripper = new org.apache.pdfbox.text.PDFTextStripper();
+            String text = stripper.getText(document);
+            if (text != null && !text.isBlank()) {
+                return text.trim();
             }
+
+            int pageCount = document.getNumberOfPages();
+            if (pageCount == 0) {
+                return null;
+            }
+            if (pageCount > MAX_OCR_PAGES) {
+                throw new IllegalStateException("\"" + label + "\" is a scanned document with " + pageCount +
+                        " pages, which exceeds the " + MAX_OCR_PAGES + "-page limit for OCR. Please split it " +
+                        "into smaller files and upload them separately.");
+            }
+
+            PDFRenderer renderer = new PDFRenderer(document);
+            StringBuilder ocrText = new StringBuilder();
+            for (int i = 0; i < pageCount; i++) {
+                byte[] pageJpeg = encodeAsJpeg(renderer.renderImageWithDPI(i, OCR_RENDER_DPI));
+                String pageText = groqClient.transcribeImages(List.of(pageJpeg));
+                if (pageText != null && !pageText.isBlank()) {
+                    if (ocrText.length() > 0) ocrText.append("\n\n");
+                    ocrText.append(pageText);
+                }
+            }
+
+            if (ocrText.length() == 0) {
+                return null;
+            }
+            thinkingSteps.add("🔎 Used open-source vision AI to read scanned/image content from \"" + label + "\"");
+            return ocrText.toString();
+        } catch (IllegalStateException e) {
+            throw e; // page-limit — surface as a clear job failure rather than swallowing it
+        } catch (Exception e) {
+            log.warn("PDF processing failed for {}: {}", pdfPath, e.getMessage());
+            return null;
         }
-        return images;
     }
 
     private byte[] encodeAsJpeg(BufferedImage image) throws Exception {

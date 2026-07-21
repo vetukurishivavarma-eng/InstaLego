@@ -18,7 +18,6 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.security.core.Authentication;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -189,7 +188,7 @@ public class VerificationController {
                         "Please upload at least one document before running verification"));
             }
 
-            // Start async verification through self-proxy to ensure @Transactional works
+            // Start async verification through self-proxy so @Async goes through Spring's proxy
             final Long jobId = sessionId;
             self.runAsyncVerification(jobId);
 
@@ -370,11 +369,14 @@ public class VerificationController {
     }
 
     /**
-     * Async verification that respects Spring's @Transactional proxy.
-     * Called through 'self' to ensure both @Async and @Transactional are active.
+     * Async verification. Deliberately NOT @Transactional: this runs for minutes and calls
+     * jobRepository.save(job) repeatedly to report progress (phase/thinking steps). Each save()
+     * already commits in its own transaction via Spring Data's SimpleJpaRepository — wrapping the
+     * whole method in one outer transaction would hold all those writes uncommitted (invisible to
+     * the polling GET /api/verify/{id} requests, which run in their own transactions) until the
+     * entire run finished, making the UI appear frozen until everything showed up at once.
      */
     @Async
-    @Transactional
     public void runAsyncVerification(Long jobId) {
         try {
             verificationService.runVerification(jobId);

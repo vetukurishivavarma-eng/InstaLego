@@ -40,4 +40,4 @@ services:
       # Update this if Render assigns a different backend URL than expected (e.g. the name was
       # already taken) — check the backend service's actual URL in the Render dashboard.
       - key: VITE_API_URL
-        value: https://instalego-backend.onrender.com
+        value: https://life-mortgages-predict-ought.trycloudflare.com
